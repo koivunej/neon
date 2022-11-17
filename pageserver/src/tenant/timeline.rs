@@ -2359,9 +2359,11 @@ impl Timeline {
 
                 let last_rec_lsn = data.records.last().unwrap().0;
 
+                let records: Arc<[(Lsn, _)]> = data.records.into();
+
                 let img = self
                     .walredo_mgr
-                    .request_redo(key, request_lsn, base_img, data.records, self.pg_version)
+                    .request_redo(key, request_lsn, base_img, records, self.pg_version)
                     .context("Failed to reconstruct a page image:")?;
 
                 if img.len() == page_cache::PAGE_SZ {

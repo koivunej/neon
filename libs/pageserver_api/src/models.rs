@@ -248,21 +248,21 @@ pub enum PagestreamBeMessage {
     DbSize(PagestreamDbSizeResponse),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PagestreamExistsRequest {
     pub latest: bool,
     pub lsn: Lsn,
     pub rel: RelTag,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PagestreamNblocksRequest {
     pub latest: bool,
     pub lsn: Lsn,
     pub rel: RelTag,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PagestreamGetPageRequest {
     pub latest: bool,
     pub lsn: Lsn,
