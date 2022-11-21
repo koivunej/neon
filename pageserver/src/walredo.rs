@@ -222,7 +222,7 @@ impl PostgresRedoManager {
         key: Key,
         lsn: Lsn,
         base_img: Option<Bytes>,
-        records: &std::sync::Arc<[(Lsn, NeonWalRecord)]>,
+        records: &Arc<[(Lsn, NeonWalRecord)]>,
         records_range: SliceRange,
         wal_redo_timeout: Duration,
         pg_version: u32,
@@ -1007,7 +1007,7 @@ type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
 struct Request {
     target: BufferTag,
     base_img: Option<Bytes>,
-    records: std::sync::Arc<[(Lsn, NeonWalRecord)]>,
+    records: Arc<[(Lsn, NeonWalRecord)]>,
     records_range: SliceRange,
     timeout: std::time::Duration,
 }
