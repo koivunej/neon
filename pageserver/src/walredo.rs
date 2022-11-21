@@ -695,17 +695,10 @@ fn tokio_postgres_redo(
             1024 * 8 * 3,
         );
 
-        // loop to handle wal-redo process failing in between
-        loop {
-            // tenant_mgr expects that walredo does not create the temporary directory until we get the
-            // first redo request, so postpone creation until we get the first one.
-            let first = match rx.recv().await {
-                Some(first) => first,
-                None => {
-                    break;
-                }
-            };
-
+        // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
+        // walredo does not create the temporary directory until we get the first redo request, so
+        // postpone creation until we get the first one.
+        while let Some(first) = rx.recv().await {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -735,14 +728,23 @@ fn tokio_postgres_redo(
                 let result_txs = result_txs;
                 let mut buffered = Some(first);
 
-                while let Some((request, response)) = {
-                    let next = buffered.take();
-                    if next.is_none() {
-                        rx.recv().await
-                    } else {
-                        next
-                    }
-                } {
+                loop {
+                    let (request, response) = {
+                        // TODO: could we somehow manage to keep the request in case we need to
+                        // restart the process? see https://github.com/neondatabase/neon/issues/1700
+                        let next = buffered.take();
+                        let next = if next.is_none() {
+                            rx.recv().await
+                        } else {
+                            next
+                        };
+
+                        match next {
+                            Some(t) => t,
+                            None => break,
+                        }
+                    };
+
                     let records = request.records_range.sub_slice(&request.records);
 
                     if have_vectored_stdin {
