@@ -23,6 +23,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::Serialize;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::*;
@@ -80,7 +81,7 @@ pub trait WalRedoManager: Send + Sync {
         key: Key,
         lsn: Lsn,
         base_img: Option<Bytes>,
-        records: std::sync::Arc<[(Lsn, NeonWalRecord)]>,
+        records: Vec<(Lsn, NeonWalRecord)>,
         pg_version: u32,
     ) -> Result<Bytes, WalRedoError>;
 }
@@ -145,13 +146,16 @@ impl WalRedoManager for PostgresRedoManager {
         key: Key,
         lsn: Lsn,
         base_img: Option<Bytes>,
-        records: std::sync::Arc<[(Lsn, NeonWalRecord)]>,
+        records: Vec<(Lsn, NeonWalRecord)>,
         pg_version: u32,
     ) -> Result<Bytes, WalRedoError> {
         if records.is_empty() {
             error!("invalid WAL redo request with no records");
             return Err(WalRedoError::InvalidRequest);
         }
+
+        // convert it to an arc to avoid cloning it on batches
+        let records: Arc<[(Lsn, NeonWalRecord)]> = records.into();
 
         let mut img: Option<Bytes> = base_img;
         let mut batch_neon = can_apply_in_neon(&records[0].1);
@@ -1221,7 +1225,7 @@ mod tests {
     }
 
     // benches/bench_walredo.rs uses a Request construction but don't recreate it here just yet
-    fn short_records() -> std::sync::Arc<[(Lsn, NeonWalRecord)]> {
+    fn short_records() -> Vec<(Lsn, NeonWalRecord)> {
         vec![
             (
                 Lsn::from_str("0/16A9388").unwrap(),
