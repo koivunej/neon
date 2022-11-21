@@ -93,7 +93,6 @@ pub trait WalRedoManager: Send + Sync {
 /// records.
 ///
 pub struct PostgresRedoManager {
-    tenant_id: TenantId,
     conf: &'static PageServerConf,
     handle: Handle,
 }
@@ -206,11 +205,7 @@ impl PostgresRedoManager {
         let (handle, fut) = tokio_postgres_redo(conf, tenant_id, 14);
         BACKGROUND_RUNTIME.spawn(fut);
 
-        PostgresRedoManager {
-            tenant_id,
-            conf,
-            handle,
-        }
+        PostgresRedoManager { conf, handle }
     }
 
     ///
