@@ -535,13 +535,8 @@ impl PostgresRedoManager {
 ///
 /// The request is combination of `B + P + A* + G`.
 ///
-/// Attempted approaches:
-/// - use a lot of different (small) bytes => slow/no benefit
-/// - use this from the `stdin` async task => slow/no benefit
-///
-/// Current version builds 1-3 segment message by including the page as separate. Currently the
-/// message building is done over at caller's side, before calling anything async to follow with
-/// the branch `walredo-channel`. It is probably more efficient than cloning the record subslice.
+/// Compared to [`build_vectored_messages`], this implementation builds at most 3 messages if the
+/// base version of page is included (it's never copied to conserve the "scratch" space).
 fn build_messages(
     target: BufferTag,
     base_img: Option<Bytes>,
@@ -564,9 +559,7 @@ fn build_messages(
         buffers.push(page);
     }
 
-    let mut records = records.iter();
-
-    while let Some((end_lsn, record)) = records.next() {
+    for (end_lsn, record) in records {
         let (_will_init, rec) = match record {
             NeonWalRecord::Postgres { will_init, rec } => (will_init, rec),
             _ => unreachable!(),
@@ -583,6 +576,8 @@ fn build_messages(
     buffers.push(out);
 }
 
+/// Compared to [`build_messages`] builds many small messages and aiming for vectored write
+/// handling the gathering of the already allocated records.
 fn build_vectored_messages(
     target: BufferTag,
     base_img: Option<Bytes>,
