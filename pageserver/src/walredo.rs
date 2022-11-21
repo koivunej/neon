@@ -231,14 +231,15 @@ impl PostgresRedoManager {
 
         let record_count = records_range.sub_slice(records).len() as u64;
 
-        let result = BACKGROUND_RUNTIME
-            .block_on(self.handle.request_redo(Request {
+        let result = self
+            .handle
+            .request_redo(Request {
                 target: buf_tag,
                 base_img,
                 records: records.clone(),
                 records_range,
                 timeout: wal_redo_timeout,
-            }))
+            })
             .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
 
         let duration = start_time.elapsed();
@@ -678,7 +679,7 @@ fn tokio_postgres_redo(
     // precise sizing for this would be pipe size divided by our average redo request
     let expected_inflight = 32;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
+    let (tx, rx) = flume::bounded::<Payload>(expected_inflight);
 
     let ipc = async move {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -693,7 +694,7 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Some(first) = rx.recv().await {
+        while let Some(first) = rx.recv_async().await.ok() {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -712,7 +713,7 @@ fn tokio_postgres_redo(
             let stderr = child.stderr.take().expect("not taken yet");
             let mut stderr = tokio::io::BufReader::new(stderr);
 
-            let (result_txs, result_rx) = tokio::sync::mpsc::channel(expected_inflight);
+            let (result_txs, result_rx) = flume::bounded(expected_inflight);
 
             let have_vectored_stdin = stdin.is_write_vectored();
 
@@ -729,7 +730,7 @@ fn tokio_postgres_redo(
                         // restart the process? see https://github.com/neondatabase/neon/issues/1700
                         let next = buffered.take();
                         let next = if next.is_none() {
-                            rx.recv().await
+                            rx.recv_async().await.ok()
                         } else {
                             next
                         };
@@ -776,23 +777,24 @@ fn tokio_postgres_redo(
                         stdin.flush().await.map_err(anyhow::Error::new)
                     };
 
-                    let slot = async { result_txs.reserve().await };
+                    match write_res.await {
+                        Ok(()) => {
+                            if let Err(closed) = result_txs
+                                .send_async((
+                                    response,
+                                    tokio::time::Instant::now() + request.timeout,
+                                ))
+                                .await
+                            {
+                                let response = closed.0 .0;
 
-                    match tokio::join!(write_res, slot) {
-                        (Ok(()), Ok(slot)) => {
-                            // because we are pipelining, "start counting" the timeout only after we have
-                            // written everything.
-                            slot.send((response, tokio::time::Instant::now() + request.timeout));
+                                drop(
+                                    response
+                                        .send(Err(anyhow::anyhow!("Stdout task closed already"))),
+                                );
+                            }
                         }
-                        (Ok(()), Err(_closed)) => {
-                            drop(
-                                response
-                                    .send(Err(anyhow::anyhow!("Failed to receive the response"))),
-                            );
-                            return Err("stdout closed channel");
-                        }
-                        (Err(io), Ok(slot)) => {
-                            drop(slot);
+                        Err(io) => {
                             drop(
                                 response
                                     .send(Err(io).context("Failed to write request to wal-redo")),
@@ -801,16 +803,7 @@ fn tokio_postgres_redo(
                             // stdout task will exit upon seeing we've dropped the result_txs.
                             return Ok(());
                         }
-                        (Err(io), Err(_closed)) => {
-                            drop(
-                                response
-                                    .send(Err(io).context("Failed to write request to wal-redo")),
-                            );
-                            return Err(
-                                "io error while writing request while stdout closed channel",
-                            );
-                        }
-                    };
+                    }
                 }
 
                 // the Handle or the request queue sender have been dropped; return Ok(()) to keep
@@ -831,10 +824,10 @@ fn tokio_postgres_redo(
 
             let stdout_task = async {
                 // TODO: do these pages are put it in a cache? if not, could use a larger buffer
-                let mut result_rx = result_rx;
+                let result_rx = result_rx;
                 let mut page_buf = BytesMut::with_capacity(8192);
 
-                while let Some((completion, timeout_at)) = result_rx.recv().await {
+                while let Some((completion, timeout_at)) = result_rx.recv_async().await.ok() {
                     let read_page = async {
                         loop {
                             let read = stdout
@@ -1009,7 +1002,7 @@ async fn launch_walredo(
         .context("postgres --wal-redo command failed to start")
 }
 
-type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
+type Payload = (Request, flume::Sender<anyhow::Result<Bytes>>);
 
 /// WAL Redo request
 struct Request {
@@ -1022,20 +1015,22 @@ struct Request {
 
 #[derive(Clone)]
 struct Handle {
-    tx: tokio::sync::mpsc::Sender<Payload>,
+    //tx: tokio::sync::mpsc::Sender<Payload>,
+    tx: flume::Sender<Payload>,
 }
 
 impl Handle {
-    async fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
+        let (result_tx, result_rx) = flume::bounded(1);
+
+        // let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         self.tx
             .send((request, result_tx))
-            .await
             .map_err(|_| anyhow::anyhow!("Failed to communicate with the walredo task"))?;
 
         let res = result_rx
-            .await
+            .recv()
             .context("Failed to get a WAL Redo'd page back")
             .and_then(|x| x);
 
