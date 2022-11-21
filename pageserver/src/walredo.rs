@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(page, crate::ZERO_PAGE);
     }
 
-    // benches/bench_walredo.rs uses a Request construction but don't recreate it here just yet
+    #[allow(clippy::octal_escapes)]
     fn short_records() -> Vec<(Lsn, NeonWalRecord)> {
         vec![
             (
@@ -1211,7 +1211,7 @@ mod tests {
                     rec: Bytes::from_static(b"\xbc\0\0\0\0\0\0\0h?m\x01\0\0\0\0p\n\0\09\x08\xa3\xea\0 \x8c\0\x7f\x06\0\0\xd22\0\0\xeb\x04\0\0\0\0\0\0\xff\x02\0@\0\0another_table\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x98\x08\0\0\x02@\0\0\0\0\0\0\n\0\0\0\x02\0\0\0\0@\0\0\0\0\0\0\x05\0\0\0\0@zD\x05\0\0\0\0\0\0\0\0\0pr\x01\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\x04\0\0\x01\0\0\0\x02\0")
                 }
             )
-        ].into()
+        ]
     }
 
     struct RedoHarness {
