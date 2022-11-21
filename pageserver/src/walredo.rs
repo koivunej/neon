@@ -740,8 +740,6 @@ fn tokio_postgres_redo(
                         }
                     };
 
-                    let optimistic_reservation = result_txs.try_reserve().ok();
-
                     let records = request.records_range.sub_slice(&request.records);
 
                     if have_vectored_stdin {
@@ -778,13 +776,7 @@ fn tokio_postgres_redo(
                         stdin.flush().await.map_err(anyhow::Error::new)
                     };
 
-                    let slot = async {
-                        if let Some(slot) = optimistic_reservation {
-                            Ok(slot)
-                        } else {
-                            result_txs.reserve().await
-                        }
-                    };
+                    let slot = async { result_txs.reserve().await };
 
                     match tokio::join!(write_res, slot) {
                         (Ok(()), Ok(slot)) => {
