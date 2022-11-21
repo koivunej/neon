@@ -769,40 +769,48 @@ fn tokio_postgres_redo(
                                     &mut buffers,
                                 )
                             })
-                            .await?;
+                            .await
+                            .map_err(anyhow::Error::new)?;
                         }
                         // in general flush is not needed, does nothing on pipes
-                        stdin.flush().await
-                    }
-                    .await;
+                        stdin.flush().await.map_err(anyhow::Error::new)
+                    };
 
-                    match write_res {
-                        Ok(()) => {}
-                        Err(e) => {
+                    let slot = async { result_txs.reserve().await };
+
+                    match tokio::join!(write_res, slot) {
+                        (Ok(()), Ok(slot)) => {
+                            // because we are pipelining, "start counting" the timeout only after we have
+                            // written everything.
+                            slot.send((response, tokio::time::Instant::now() + request.timeout));
+                        }
+                        (Ok(()), Err(_closed)) => {
                             drop(
-                                response.send(
-                                    Err(anyhow::Error::new(e))
-                                        .context("Failed to write request to wal-redo"),
-                                ),
+                                response
+                                    .send(Err(anyhow::anyhow!("Failed to receive the response"))),
                             );
-                            // we can still continue processing already pipelined tasks, if any.
-                            // the stdout task will exit upon seeing we've dropped the result_txs.
+                            return Err("stdout closed channel");
+                        }
+                        (Err(io), Ok(slot)) => {
+                            drop(slot);
+                            drop(
+                                response
+                                    .send(Err(io).context("Failed to write request to wal-redo")),
+                            );
+                            // we can still continue processing pipelined requests, if any. the
+                            // stdout task will exit upon seeing we've dropped the result_txs.
                             return Ok(());
                         }
-                    }
-
-                    // because we are pipelining, "start counting" the timeout only after we have
-                    // written everything.
-
-                    let send_res = result_txs
-                        .send((response, tokio::time::Instant::now() + request.timeout))
-                        .await;
-
-                    if let Err(tokio::sync::mpsc::error::SendError((response, _))) = send_res {
-                        // write side is already gone, resolve this with a specific error
-                        drop(response.send(Err(anyhow::anyhow!("Failed to read from wal-redo"))));
-                        return Err("stdin: failed to send the response over to read task");
-                    }
+                        (Err(io), Err(_closed)) => {
+                            drop(
+                                response
+                                    .send(Err(io).context("Failed to write request to wal-redo")),
+                            );
+                            return Err(
+                                "io error while writing request while stdout closed channel",
+                            );
+                        }
+                    };
                 }
 
                 // the Handle or the request queue sender have been dropped; return Ok(()) to keep
