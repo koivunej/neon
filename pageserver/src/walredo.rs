@@ -32,7 +32,6 @@ use utils::{bin_ser::BeSer, id::TenantId, lsn::Lsn};
 
 use crate::metrics::{
     WAL_REDO_BYTES_HISTOGRAM, WAL_REDO_RECORDS_HISTOGRAM, WAL_REDO_RECORD_COUNTER, WAL_REDO_TIME,
-    WAL_REDO_WAIT_TIME,
 };
 use crate::pgdatadir_mapping::{key_to_rel_block, key_to_slru_block};
 use crate::repository::Key;
