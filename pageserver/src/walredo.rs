@@ -96,10 +96,7 @@ pub trait WalRedoManager: Send + Sync {
 pub struct PostgresRedoManager {
     tenant_id: TenantId,
     conf: &'static PageServerConf,
-
-    process: Handle,
-
-    handle: tokio::runtime::Handle,
+    handle: Handle,
 }
 
 /// Can this request be served by neon redo functions
@@ -210,17 +207,12 @@ impl PostgresRedoManager {
     pub fn new(conf: &'static PageServerConf, tenant_id: TenantId) -> PostgresRedoManager {
         // The actual process is launched lazily, on first request.
 
-        let handle = tokio::runtime::Handle::try_current()
-            .expect("postgres redo manager needs to be created within tokio context");
+        let (handle, fut) = tokio_postgres_redo(conf, tenant_id, 14);
+        BACKGROUND_RUNTIME.spawn(fut);
 
         PostgresRedoManager {
             tenant_id,
             conf,
-            process: {
-                let (process, fut) = tokio_postgres_redo(conf, tenant_id, 14);
-                handle.spawn(fut);
-                process
-            },
             handle,
         }
     }
@@ -246,9 +238,8 @@ impl PostgresRedoManager {
         // Relational WAL records are applied using wal-redo-postgres
         let buf_tag = BufferTag { rel, blknum };
 
-        let result = self
-            .handle
-            .block_on(self.process.request_redo(Request {
+        let result = BACKGROUND_RUNTIME
+            .block_on(self.handle.request_redo(Request {
                 target: buf_tag,
                 base_img,
                 records: records.clone(),
@@ -1163,62 +1154,56 @@ mod tests {
     use std::str::FromStr;
     use utils::{id::TenantId, lsn::Lsn};
 
-    #[tokio::test]
-    async fn short_v14_redo() {
+    #[test]
+    fn short_v14_redo() {
         // prettier than embedding the 8192 bytes here though most of it are zeroes
         // PRE-MERGE: zstd would cut it to 263 bytes, consider in review?
         let expected = std::fs::read("fixtures/short_v14_redo.page").unwrap();
 
-        let page = tokio::task::spawn_blocking(|| {
-            let h = RedoHarness::new().unwrap();
-            h.manager
-                .request_redo(
-                    Key {
-                        field1: 0,
-                        field2: 1663,
-                        field3: 13010,
-                        field4: 1259,
-                        field5: 0,
-                        field6: 0,
-                    },
-                    Lsn::from_str("0/16E2408").unwrap(),
-                    None,
-                    short_records(),
-                    14,
-                )
-                .unwrap()
-        })
-        .await
-        .unwrap();
+        let h = RedoHarness::new().unwrap();
+        let page = h
+            .manager
+            .request_redo(
+                Key {
+                    field1: 0,
+                    field2: 1663,
+                    field3: 13010,
+                    field4: 1259,
+                    field5: 0,
+                    field6: 0,
+                },
+                Lsn::from_str("0/16E2408").unwrap(),
+                None,
+                short_records(),
+                14,
+            )
+            .unwrap();
 
         assert_eq!(&expected, &*page);
     }
 
-    #[tokio::test]
-    async fn short_v14_fails_for_wrong_key_but_returns_zero_page() {
-        let page = tokio::task::spawn_blocking(|| {
-            let h = RedoHarness::new().unwrap();
+    #[test]
+    fn short_v14_fails_for_wrong_key_but_returns_zero_page() {
+        let h = RedoHarness::new().unwrap();
 
-            h.manager
-                .request_redo(
-                    Key {
-                        field1: 0,
-                        field2: 1663,
-                        // key should be 13010
-                        field3: 13130,
-                        field4: 1259,
-                        field5: 0,
-                        field6: 0,
-                    },
-                    Lsn::from_str("0/16E2408").unwrap(),
-                    None,
-                    short_records(),
-                    14,
-                )
-                .unwrap()
-        })
-        .await
-        .unwrap();
+        let page = h
+            .manager
+            .request_redo(
+                Key {
+                    field1: 0,
+                    field2: 1663,
+                    // key should be 13010
+                    field3: 13130,
+                    field4: 1259,
+                    field5: 0,
+                    field6: 0,
+                },
+                Lsn::from_str("0/16E2408").unwrap(),
+                None,
+                short_records(),
+                14,
+            )
+            .unwrap();
 
         // TODO: there will be some stderr printout, which is forwarded to tracing that could
         // perhaps be captured as long as it's in the same thread.
