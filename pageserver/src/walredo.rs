@@ -201,9 +201,6 @@ impl PostgresRedoManager {
     ///
     /// Create a new PostgresRedoManager.
     ///
-    // called from:
-    // - attach_local_tenants <= main
-    // - create_tenant <= http
     pub fn new(conf: &'static PageServerConf, tenant_id: TenantId) -> PostgresRedoManager {
         // The actual process is launched lazily, on first request.
 
@@ -633,13 +630,6 @@ fn build_push_page_header(tag: &Bytes, scratch: &mut BytesMut) {
     scratch.put_u8(b'P');
     scratch.put_u32(4 + BufferTag::LEN + page_len);
     scratch.put(tag.clone());
-}
-
-fn build_apply_record_message(end_lsn: &Lsn, record: &Bytes, scratch: &mut BytesMut) {
-    let record_len = u32::try_from(record.len()).expect("record length overflow");
-    build_apply_record_header(end_lsn, record_len, scratch);
-    // debatable if this should be copied right away or copied later; these are small
-    scratch.put(record.clone());
 }
 
 fn build_apply_record_header(end_lsn: &Lsn, record_len: u32, scratch: &mut BytesMut) {
