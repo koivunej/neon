@@ -31,33 +31,7 @@ fn redo_scenarios(c: &mut Criterion) {
     let conf = Box::leak(Box::new(conf));
     let tenant_id = TenantId::generate();
 
-    let (tokio_handle, stop_tx, join_handle) = {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
-
-        let jh = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
-            tx.send(rt.handle().to_owned()).unwrap();
-
-            let _ = stop_rx.recv();
-
-            tracing::info!("shutting down");
-
-            rt.shutdown_timeout(std::time::Duration::from_secs(1));
-        });
-
-        (rx.recv().unwrap(), stop_tx, jh)
-    };
-
-    let manager = {
-        let _g = tokio_handle.enter();
-        PostgresRedoManager::new(conf, tenant_id)
-        // manager.launch_process(14).unwrap();
-    };
+    let manager = PostgresRedoManager::new(conf, tenant_id);
 
     let manager = Arc::new(manager);
 
@@ -88,9 +62,6 @@ fn redo_scenarios(c: &mut Criterion) {
     }
 
     drop(manager);
-
-    drop(stop_tx);
-    join_handle.join().unwrap();
 
     repo_dir.into_path();
 }
