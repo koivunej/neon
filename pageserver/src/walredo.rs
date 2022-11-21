@@ -234,6 +234,8 @@ impl PostgresRedoManager {
         // Relational WAL records are applied using wal-redo-postgres
         let buf_tag = BufferTag { rel, blknum };
 
+        let record_count = records_range.sub_slice(records).len() as u64;
+
         let result = BACKGROUND_RUNTIME
             .block_on(self.handle.request_redo(Request {
                 target: buf_tag,
@@ -258,6 +260,7 @@ impl PostgresRedoManager {
         WAL_REDO_TIME.observe(duration.as_secs_f64());
         WAL_REDO_RECORDS_HISTOGRAM.observe(len as f64);
         WAL_REDO_BYTES_HISTOGRAM.observe(nbytes as f64);
+        WAL_REDO_RECORD_COUNTER.inc_by(record_count);
 
         debug!(
             "postgres applied {} WAL records ({} bytes) in {} us to reconstruct page image at LSN {}",
