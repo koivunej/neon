@@ -220,7 +220,7 @@ impl PostgresRedoManager {
         records: &Arc<[(Lsn, NeonWalRecord)]>,
         records_range: SliceRange,
         wal_redo_timeout: Duration,
-        pg_version: u32,
+        _pg_version: u32,
     ) -> Result<Bytes, WalRedoError> {
         let (rel, blknum) = key_to_rel_block(key).or(Err(WalRedoError::InvalidRecord))?;
 
