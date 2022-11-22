@@ -215,7 +215,7 @@ impl PostgresRedoManager {
     fn apply_batch_postgres(
         &self,
         key: Key,
-        lsn: Lsn,
+        _lsn: Lsn,
         base_img: Option<Bytes>,
         records: &Arc<[(Lsn, NeonWalRecord)]>,
         records_range: SliceRange,
@@ -231,16 +231,20 @@ impl PostgresRedoManager {
 
         let record_count = records_range.sub_slice(records).len() as u64;
 
-        let result = self
-            .handle
-            .request_redo(Request {
-                target: buf_tag,
-                base_img,
-                records: records.clone(),
-                records_range,
-                timeout: wal_redo_timeout,
-            })
-            .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
+        let result = BACKGROUND_RUNTIME.block_on(async {
+            self.handle
+                .request_redo(Request {
+                    target: buf_tag,
+                    base_img,
+                    records: records.clone(),
+                    records_range,
+                    timeout: wal_redo_timeout,
+                })
+                .await
+                .map_err(|e| {
+                    WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e))
+                })
+        });
 
         let duration = start_time.elapsed();
 
@@ -258,13 +262,13 @@ impl PostgresRedoManager {
         WAL_REDO_BYTES_HISTOGRAM.observe(nbytes as f64);
         WAL_REDO_RECORD_COUNTER.inc_by(record_count);
 
-        debug!(
+        /*debug!(
             "postgres applied {} WAL records ({} bytes) in {} us to reconstruct page image at LSN {}",
             len,
             nbytes,
             duration.as_micros(),
-            lsn
-        );
+            _lsn
+        );*/
 
         result
     }
@@ -564,8 +568,9 @@ fn build_messages(
         };
 
         build_apply_record_header(end_lsn, rec.len() as u32, scratch);
-        buffers.push(scratch.split().freeze());
-        buffers.push(rec.clone());
+        scratch.put(rec.clone());
+        // buffers.push(scratch.split().freeze());
+        // buffers.push(rec.clone());
     }
 
     build_get_page_message(&tag, scratch);
@@ -679,7 +684,7 @@ fn tokio_postgres_redo(
     // precise sizing for this would be pipe size divided by our average redo request
     let expected_inflight = 32;
 
-    let (tx, rx) = flume::bounded::<Payload>(expected_inflight);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
 
     let ipc = async move {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -694,7 +699,7 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Some(first) = rx.recv_async().await.ok() {
+        while let Some(first) = rx.recv().await {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -713,14 +718,11 @@ fn tokio_postgres_redo(
             let stderr = child.stderr.take().expect("not taken yet");
             let mut stderr = tokio::io::BufReader::new(stderr);
 
-            let (result_txs, result_rx) = flume::bounded(expected_inflight);
+            let (result_txs, result_rx) = tokio::sync::mpsc::channel(expected_inflight);
 
             let have_vectored_stdin = stdin.is_write_vectored();
 
-            let stdin_task = async {
-                // cancellation safety is probably not an issue, vecdeque could be used to capture
-                // oneshot senders
-
+            let stdin_task = tokio::task::unconstrained(async {
                 let result_txs = result_txs;
                 let mut buffered = Some(first);
 
@@ -730,7 +732,7 @@ fn tokio_postgres_redo(
                         // restart the process? see https://github.com/neondatabase/neon/issues/1700
                         let next = buffered.take();
                         let next = if next.is_none() {
-                            rx.recv_async().await.ok()
+                            rx.recv().await
                         } else {
                             next
                         };
@@ -773,17 +775,17 @@ fn tokio_postgres_redo(
                             .await
                             .map_err(anyhow::Error::new)?;
                         }
+                        Ok::<_, anyhow::Error>(())
                         // in general flush is not needed, does nothing on pipes
-                        stdin.flush().await.map_err(anyhow::Error::new)
+                        // stdin.flush().await.map_err(anyhow::Error::new)
                     };
+
+                    info!("written");
 
                     match write_res.await {
                         Ok(()) => {
                             if let Err(closed) = result_txs
-                                .send_async((
-                                    response,
-                                    tokio::time::Instant::now() + request.timeout,
-                                ))
+                                .send((response, tokio::time::Instant::now() + request.timeout))
                                 .await
                             {
                                 let response = closed.0 .0;
@@ -809,7 +811,7 @@ fn tokio_postgres_redo(
                 // the Handle or the request queue sender have been dropped; return Ok(()) to keep
                 // processing any of already pipelined requests
                 Ok(())
-            }
+            })
             .instrument(info_span!("walredo-stdin"));
 
             #[derive(Debug, thiserror::Error)]
@@ -822,86 +824,111 @@ fn tokio_postgres_redo(
                 ReadTimeout,
             }
 
-            let stdout_task = async {
-                // TODO: do these pages are put it in a cache? if not, could use a larger buffer
-                let result_rx = result_rx;
-                let mut page_buf = BytesMut::with_capacity(8192);
+            let stdout_task =
+                tokio::task::spawn(
+                    tokio::task::unconstrained(async move {
+                        // TODO: do these pages are put it in a cache? if not, could use a larger buffer
+                        let mut result_rx = result_rx;
+                        let mut page_buf = BytesMut::with_capacity(8192);
 
-                while let Some((completion, timeout_at)) = result_rx.recv_async().await.ok() {
-                    let read_page = async {
-                        loop {
-                            let read = stdout
-                                .read_buf(&mut page_buf)
+                        while let Some((completion, timeout_at)) = result_rx.recv().await {
+                            info!("starting");
+
+                            let mut read_count = 0;
+
+                            let read_page = async {
+                                loop {
+                                    read_count += 1;
+                                    let read = stdout
+                                        .read_buf(&mut page_buf)
+                                        .await
+                                        .map_err(StdoutTaskError::ReadFailed)?;
+                                    if read == 0 {
+                                        return Err(StdoutTaskError::StdoutClosed);
+                                    }
+                                    if page_buf.remaining() < 8192 {
+                                        continue;
+                                    }
+                                    let page = page_buf.split().freeze();
+                                    return Ok(page);
+                                }
+                            };
+
+                            let res = tokio::time::timeout_at(timeout_at, read_page)
                                 .await
-                                .map_err(StdoutTaskError::ReadFailed)?;
-                            if read == 0 {
-                                return Err(StdoutTaskError::StdoutClosed);
-                            }
-                            if page_buf.remaining() < 8192 {
-                                continue;
-                            }
-                            let page = page_buf.split().freeze();
-                            return Ok(page);
-                        }
-                    };
+                                .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
+                                .and_then(|x| x);
 
-                    let res = tokio::time::timeout_at(timeout_at, read_page)
-                        .await
-                        .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
-                        .and_then(|x| x);
+                            match res {
+                                Ok(page) => {
+                                    // we don't care about the result, because the caller could be gone
+                                    drop(completion.send(Ok(page)));
+                                    page_buf.reserve(8192);
+                                }
+                                Err(StdoutTaskError::ReadFailed(e)) => {
+                                    drop(completion.send(
+                                        Err(e).context("Failed to read response from wal-redo"),
+                                    ));
+                                    return Err("stdout: read failed");
+                                }
+                                Err(StdoutTaskError::StdoutClosed) => {
+                                    drop(completion.send(Err(anyhow::anyhow!(
+                                        "wal-redo process closed stdout"
+                                    ))));
+                                    return Err(
+                                        "stdout: failed to read from wal-redo: closed stdout",
+                                    );
+                                }
+                                Err(StdoutTaskError::ReadTimeout) => {
+                                    drop(completion.send(Err(anyhow::anyhow!(
+                                        "Timed out while waiting for the page"
+                                    ))));
+                                    return Err("stdout: reading page timed out");
+                                }
+                            }
+                        }
+                        // in a graceful shutdown, this needs to be an Err to take down the stderr task as
+                        // well.
+                        Err::<(), _>("stdout: all requests processed, ready for shutdown")
+                    })
+                    .instrument(info_span!("walredo-stdout")),
+                );
 
-                    match res {
-                        Ok(page) => {
-                            // we don't care about the result, because the caller could be gone
-                            drop(completion.send(Ok(page)));
-                            page_buf.reserve(8192);
-                        }
-                        Err(StdoutTaskError::ReadFailed(e)) => {
-                            drop(
-                                completion
-                                    .send(Err(e).context("Failed to read response from wal-redo")),
-                            );
-                            return Err("failed to read from wal-redo stdout");
-                        }
-                        Err(StdoutTaskError::StdoutClosed) => {
-                            drop(
-                                completion
-                                    .send(Err(anyhow::anyhow!("wal-redo process closed stdout"))),
-                            );
-                            return Err("failed to read from wal-redo: closed stdout");
-                        }
-                        Err(StdoutTaskError::ReadTimeout) => {
-                            drop(completion.send(Err(anyhow::anyhow!(
-                                "Timed out while waiting for the page"
-                            ))));
-                            return Err("reading page timed out");
+            let stderr_task = tokio::task::spawn(
+                async move {
+                    let mut buffer = Vec::new();
+
+                    loop {
+                        buffer.clear();
+                        match stderr.read_until(b'\n', &mut buffer).await {
+                            Ok(0) => return Err::<(), _>("stderr: closed"),
+                            Ok(read) => {
+                                let message = String::from_utf8_lossy(&buffer[..read]);
+                                error!("wal-redo-process: {}", message.trim());
+                            }
+                            Err(e) => {
+                                error!("reading stderr failed: {e}");
+                                return Err("stderr: read failed");
+                            }
                         }
                     }
                 }
-                // in a graceful shutdown, this needs to be an Err to take down the stderr task as
-                // well.
-                Err::<(), _>("stdout: all requests processed, ready for shutdown")
+                .instrument(info_span!("walredo-stderr")),
+            );
+
+            use futures::future::TryFutureExt;
+
+            fn join_error_to_str(e: tokio::task::JoinError) -> &'static str {
+                if e.is_cancelled() {
+                    "task was cancelled"
+                } else {
+                    // we most likely have already the stacktrace dump in stderr
+                    "task panicked"
+                }
             }
-            .instrument(info_span!("walredo-stdout"));
 
-            let stderr_task = async {
-                let mut buffer = Vec::new();
-
-                loop {
-                    buffer.clear();
-                    match stderr.read_until(b'\n', &mut buffer).await {
-                        Ok(0) => return Err::<(), _>("stderr: closed"),
-                        Ok(read) => {
-                            let message = String::from_utf8_lossy(&buffer[..read]);
-                            error!("wal-redo-process: {}", message.trim());
-                        }
-                        Err(e) => {
-                            error!("reading stderr failed: {e}");
-                            return Err("stderr: read failed");
-                        }
-                    }
-                }
-            };
+            let stdout_task = stdout_task.map_err(join_error_to_str);
+            let stderr_task = stderr_task.map_err(join_error_to_str);
 
             async {
                 // ignore the result, it is always Err from one of the tasks, upon which we stop
@@ -926,7 +953,7 @@ fn tokio_postgres_redo(
                     }
                 }
             }
-            .instrument(info_span!("walredo", pid, %tenant_id))
+            .instrument(info_span!("wal-redo", pid, %tenant_id))
             .await
         }
 
@@ -1002,7 +1029,7 @@ async fn launch_walredo(
         .context("postgres --wal-redo command failed to start")
 }
 
-type Payload = (Request, flume::Sender<anyhow::Result<Bytes>>);
+type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
 
 /// WAL Redo request
 struct Request {
@@ -1015,22 +1042,23 @@ struct Request {
 
 #[derive(Clone)]
 struct Handle {
-    //tx: tokio::sync::mpsc::Sender<Payload>,
-    tx: flume::Sender<Payload>,
+    tx: tokio::sync::mpsc::Sender<Payload>,
+    // tx: flume::Sender<Payload>,
 }
 
 impl Handle {
-    fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
-        let (result_tx, result_rx) = flume::bounded(1);
+    async fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
+        // let (result_tx, result_rx) = flume::bounded(1);
 
-        // let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         self.tx
             .send((request, result_tx))
+            .await
             .map_err(|_| anyhow::anyhow!("Failed to communicate with the walredo task"))?;
 
         let res = result_rx
-            .recv()
+            .await
             .context("Failed to get a WAL Redo'd page back")
             .and_then(|x| x);
 
@@ -1069,10 +1097,18 @@ impl SliceRange {
 /// Used to build vectorized writes, in case we have a base page.
 ///
 /// Adapted from https://github.com/tokio-rs/bytes/pull/371
-#[derive(Default)]
 struct BufQueue {
     bufs: std::collections::VecDeque<Bytes>,
     remaining: usize,
+}
+
+impl Default for BufQueue {
+    fn default() -> Self {
+        Self {
+            bufs: std::collections::VecDeque::with_capacity(4),
+            remaining: 0,
+        }
+    }
 }
 
 impl BufQueue {
