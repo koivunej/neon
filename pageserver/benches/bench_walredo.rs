@@ -79,15 +79,16 @@ fn add_multithreaded_walredo_requesters(
     if threads == 1 {
         b.iter_batched_ref(
             || {
-                std::iter::repeat(input_factory())
-                    .take(request_repeats)
-                    .collect::<Vec<_>>()
+                /*std::iter::repeat(input_factory())
+                .take(request_repeats)
+                .collect::<Vec<_>>()*/
+                Some(input_factory())
             },
-            |input| execute_all(input.drain(..), &*manager),
+            |input| execute_all(input.take(), &*manager),
             criterion::BatchSize::PerIteration,
         );
     } else {
-        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(10);
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(threads as usize);
 
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
 
@@ -105,9 +106,11 @@ fn add_multithreaded_walredo_requesters(
                             break;
                         }
 
-                        let input = std::iter::repeat(input_factory())
-                            .take(request_repeats)
-                            .collect::<Vec<_>>();
+                        /*let input = std::iter::repeat(input_factory())
+                        .take(request_repeats)
+                        .collect::<Vec<_>>();*/
+
+                        let input = Some(input_factory());
 
                         barrier.wait();
 
