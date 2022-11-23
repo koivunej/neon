@@ -609,8 +609,12 @@ fn build_vectored_messages(
 
         let record_len = rec.len() as u32;
         build_apply_record_header(end_lsn, record_len, scratch);
-        buffers.push(scratch.split().freeze());
-        buffers.push(rec.clone());
+        if rec.len() < 1024 {
+            scratch.put(rec.clone());
+        } else {
+            buffers.push(scratch.split().freeze());
+            buffers.push(rec.clone());
+        }
     }
 
     build_get_page_message(&tag, scratch);
