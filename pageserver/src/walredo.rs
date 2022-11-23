@@ -868,6 +868,13 @@ fn tokio_postgres_redo(
 
                                 let (completion, timeout_at) = loop {
                                     tokio::select! {
+                                        // use biased to arrange the read and await for read
+                                        // becoming ready as early as possible, as
+                                        // the wait and following wakeup is a major source of
+                                        // delay given the high performance of the walredo
+                                        // process.
+                                        biased;
+
                                         res = &mut read_page, if page_res.is_none() => {
                                             page_res = Some(res);
                                         }
@@ -880,14 +887,19 @@ fn tokio_postgres_redo(
                                     }
                                 };
 
-                                (match page_res {
+                                let page_res = match page_res {
                                     Some(res) => res,
                                     None => {
+                                        // since we did not already complete (as is likely), wrap
+                                        // the read in a timeout now that we know the deadline, and
+                                        // wait for it.
                                         tokio::time::timeout_at(timeout_at, read_page).await
                                             .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
                                             .and_then(|x| x)
                                     }
-                                }, completion)
+                                };
+
+                                (page_res, completion)
                             };
 
                             match res {
@@ -918,65 +930,6 @@ fn tokio_postgres_redo(
                                 }
                             }
                         }
-
-                        /*
-                        while let Some((completion, timeout_at)) = result_rx.recv().await {
-                            info!("starting");
-
-                            let mut read_count = 0;
-
-                            let read_page = async {
-                                loop {
-                                    read_count += 1;
-                                    let read = stdout
-                                        .read_buf(&mut page_buf)
-                                        .await
-                                        .map_err(StdoutTaskError::ReadFailed)?;
-                                    if read == 0 {
-                                        return Err(StdoutTaskError::StdoutClosed);
-                                    }
-                                    if page_buf.remaining() < 8192 {
-                                        continue;
-                                    }
-                                    let page = page_buf.split().freeze();
-                                    return Ok(page);
-                                }
-                            };
-
-                            let res = tokio::time::timeout_at(timeout_at, read_page)
-                                .await
-                                .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
-                                .and_then(|x| x);
-
-                            match res {
-                                Ok(page) => {
-                                    // we don't care about the result, because the caller could be gone
-                                    drop(completion.send(Ok(page)));
-                                    page_buf.reserve(8192);
-                                }
-                                Err(StdoutTaskError::ReadFailed(e)) => {
-                                    drop(completion.send(
-                                        Err(e).context("Failed to read response from wal-redo"),
-                                    ));
-                                    return Err("stdout: read failed");
-                                }
-                                Err(StdoutTaskError::StdoutClosed) => {
-                                    drop(completion.send(Err(anyhow::anyhow!(
-                                        "wal-redo process closed stdout"
-                                    ))));
-                                    return Err(
-                                        "stdout: failed to read from wal-redo: closed stdout",
-                                    );
-                                }
-                                Err(StdoutTaskError::ReadTimeout) => {
-                                    drop(completion.send(Err(anyhow::anyhow!(
-                                        "Timed out while waiting for the page"
-                                    ))));
-                                    return Err("stdout: reading page timed out");
-                                }
-                            }
-                        }
-                        */
                         // in a graceful shutdown, this needs to be an Err to take down the stderr task as
                         // well.
                         Err::<(), _>("stdout: all requests processed, ready for shutdown")
