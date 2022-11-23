@@ -693,7 +693,7 @@ fn tokio_postgres_redo(
         let mut scratch = BytesMut::with_capacity(
             // without vectoring we aim at 3 messages: begin, page, records + get_page,
             // with vectoring this will be very much enough
-            1024 * 8 * 3,
+            1024 * 64,
         );
 
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
