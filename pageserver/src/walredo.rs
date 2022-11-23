@@ -687,7 +687,7 @@ fn tokio_postgres_redo(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
 
     let ipc = async move {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
         let mut buffers = BufQueue::default();
         let mut scratch = BytesMut::with_capacity(
