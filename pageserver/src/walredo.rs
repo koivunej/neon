@@ -743,6 +743,8 @@ fn tokio_postgres_redo(
                         }
                     };
 
+                    let timeout_at = tokio::time::Instant::now() + request.timeout;
+
                     let records = request.records_range.sub_slice(&request.records);
 
                     if have_vectored_stdin {
@@ -780,14 +782,17 @@ fn tokio_postgres_redo(
                         // stdin.flush().await.map_err(anyhow::Error::new)
                     };
 
-                    info!("written");
+                    let write_res = tokio::time::timeout_at(timeout_at, write_res)
+                        .map_err(|_| anyhow::anyhow!("write timeout"));
 
-                    match write_res.await {
+                    // wait the write to complete before sending the completion over, since we
+                    // cannot fail the request after it has been moved. this could be worked
+                    // around by making the oneshot into a normal mpsc queue of size 2 and
+                    // making the read side race against the channel closing and timeouted
+                    // read.
+                    match write_res.await.and_then(|x| x) {
                         Ok(()) => {
-                            if let Err(closed) = result_txs
-                                .send((response, tokio::time::Instant::now() + request.timeout))
-                                .await
-                            {
+                            if let Err(closed) = result_txs.send((response, timeout_at)).await {
                                 let response = closed.0 .0;
 
                                 drop(
@@ -796,11 +801,10 @@ fn tokio_postgres_redo(
                                 );
                             }
                         }
-                        Err(io) => {
-                            drop(
-                                response
-                                    .send(Err(io).context("Failed to write request to wal-redo")),
-                            );
+                        Err(io_or_timeout) => {
+                            drop(response.send(
+                                Err(io_or_timeout).context("Failed to write request to wal-redo"),
+                            ));
                             // we can still continue processing pipelined requests, if any. the
                             // stdout task will exit upon seeing we've dropped the result_txs.
                             return Ok(());
