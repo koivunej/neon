@@ -686,6 +686,7 @@ fn tokio_postgres_redo(
     use tokio::io::AsyncWrite;
 
     // precise sizing for this would be pipe size divided by our average redo request
+    // theoretically we could fit almost 60 small requests as used in the tests.
     let expected_inflight = 32;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
@@ -999,12 +1000,12 @@ fn tokio_postgres_redo(
                         error!("failed to wait for child process to exit: {e}");
                     }
                 }
+                info!("wal-redo task exiting");
             }
             .instrument(info_span!("wal-redo", pid, %tenant_id))
-            .await
+            .await;
         }
 
-        info!(tenant_id = %tenant_id, "wal-redo task exiting");
         Ok(())
     };
 
