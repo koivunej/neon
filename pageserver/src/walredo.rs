@@ -231,20 +231,16 @@ impl PostgresRedoManager {
 
         let record_count = records_range.sub_slice(records).len() as u64;
 
-        let result = BACKGROUND_RUNTIME.block_on(async {
-            self.handle
-                .request_redo(Request {
-                    target: buf_tag,
-                    base_img,
-                    records: records.clone(),
-                    records_range,
-                    timeout: wal_redo_timeout,
-                })
-                .await
-                .map_err(|e| {
-                    WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e))
-                })
-        });
+        let result = self
+            .handle
+            .request_redo(Request {
+                target: buf_tag,
+                base_img,
+                records: records.clone(),
+                records_range,
+                timeout: wal_redo_timeout,
+            })
+            .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
 
         let duration = start_time.elapsed();
 
@@ -689,7 +685,7 @@ fn tokio_postgres_redo(
     // theoretically we could fit almost 60 small requests as used in the tests.
     let expected_inflight = 32;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
+    let (tx, rx) = flume::bounded::<Payload>(expected_inflight);
 
     let ipc = async move {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -704,7 +700,7 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Some(first) = rx.recv().await {
+        while let Some(first) = rx.recv_async().await.ok() {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -737,7 +733,7 @@ fn tokio_postgres_redo(
                         // restart the process? see https://github.com/neondatabase/neon/issues/1700
                         let next = buffered.take();
                         let next = if next.is_none() {
-                            rx.recv().await
+                            rx.recv_async().await.ok()
                         } else {
                             next
                         };
@@ -1077,7 +1073,7 @@ async fn launch_walredo(
         .context("postgres --wal-redo command failed to start")
 }
 
-type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
+type Payload = (Request, flume::Sender<anyhow::Result<Bytes>>);
 
 /// WAL Redo request
 struct Request {
@@ -1090,23 +1086,19 @@ struct Request {
 
 #[derive(Clone)]
 struct Handle {
-    tx: tokio::sync::mpsc::Sender<Payload>,
-    // tx: flume::Sender<Payload>,
+    tx: flume::Sender<Payload>,
 }
 
 impl Handle {
-    async fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
-        // let (result_tx, result_rx) = flume::bounded(1);
-
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
+        let (result_tx, result_rx) = flume::bounded(1);
 
         self.tx
             .send((request, result_tx))
-            .await
             .map_err(|_| anyhow::anyhow!("Failed to communicate with the walredo task"))?;
 
         let res = result_rx
-            .await
+            .recv()
             .context("Failed to get a WAL Redo'd page back")
             .and_then(|x| x);
 
