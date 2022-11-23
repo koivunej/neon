@@ -700,7 +700,7 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Some(first) = rx.recv_async().await.ok() {
+        while let Ok(first) = rx.recv_async().await {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -1097,12 +1097,10 @@ impl Handle {
             .send((request, result_tx))
             .map_err(|_| anyhow::anyhow!("Failed to communicate with the walredo task"))?;
 
-        let res = result_rx
+        result_rx
             .recv()
             .context("Failed to get a WAL Redo'd page back")
-            .and_then(|x| x);
-
-        res
+            .and_then(|x| x)
     }
 }
 
