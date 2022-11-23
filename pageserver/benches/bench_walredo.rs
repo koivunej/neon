@@ -46,7 +46,7 @@ fn redo_scenarios(c: &mut Criterion) {
             BenchmarkId::new("short-50record", thread_count),
             &thread_count,
             |b, thread_count| {
-                add_multithreaded_walredo_requesters(b, *thread_count, &manager, short, 50);
+                add_multithreaded_walredo_requesters(b, *thread_count, &manager, short);
             },
         );
     }
@@ -56,7 +56,7 @@ fn redo_scenarios(c: &mut Criterion) {
             BenchmarkId::new("medium-10record", thread_count),
             &thread_count,
             |b, thread_count| {
-                add_multithreaded_walredo_requesters(b, *thread_count, &manager, medium, 10);
+                add_multithreaded_walredo_requesters(b, *thread_count, &manager, medium);
             },
         );
     }
@@ -72,18 +72,12 @@ fn add_multithreaded_walredo_requesters(
     threads: u32,
     manager: &Arc<PostgresRedoManager>,
     input_factory: fn() -> Request,
-    request_repeats: usize,
 ) {
     assert_ne!(threads, 0);
 
     if threads == 1 {
         b.iter_batched_ref(
-            || {
-                /*std::iter::repeat(input_factory())
-                .take(request_repeats)
-                .collect::<Vec<_>>()*/
-                Some(input_factory())
-            },
+            || Some(input_factory()),
             |input| execute_all(input.take(), &*manager),
             criterion::BatchSize::PerIteration,
         );
@@ -105,10 +99,6 @@ fn add_multithreaded_walredo_requesters(
                         if work_rx.lock().unwrap().recv().is_err() {
                             break;
                         }
-
-                        /*let input = std::iter::repeat(input_factory())
-                        .take(request_repeats)
-                        .collect::<Vec<_>>();*/
 
                         let input = Some(input_factory());
 
@@ -183,6 +173,7 @@ macro_rules! lsn {
     }};
 }
 
+/// Short payload, 1132 bytes.
 // pg_records are copypasted from log, where they are put with Debug impl of Bytes, which uses \0
 // for null bytes.
 #[allow(clippy::octal_escapes)]
@@ -212,6 +203,7 @@ fn short() -> Request {
     }
 }
 
+/// Medium sized payload, serializes as 26393 bytes.
 // see [`short`]
 #[allow(clippy::octal_escapes)]
 fn medium() -> Request {
