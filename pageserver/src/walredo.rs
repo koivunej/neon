@@ -740,6 +740,30 @@ fn tokio_postgres_redo(
             let mut stdin = child.stdin.take().expect("not taken yet");
             // stdout is used to communicate the resulting page
             let mut stdout = child.stdout.take().expect("not taken yet");
+
+            use std::os::unix::io::AsRawFd;
+
+            nix::fcntl::fcntl(
+                stdout.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETPIPE_SZ(8192 * 4),
+            )
+            .unwrap();
+
+            nix::fcntl::fcntl(
+                stdin.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETPIPE_SZ(1048576),
+            )
+            .unwrap();
+
+            let pipe_sizes =
+                nix::fcntl::fcntl(stdin.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ).unwrap();
+            let pipe_sizes = (
+                pipe_sizes,
+                nix::fcntl::fcntl(stdout.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ).unwrap(),
+            );
+
+            info!(stdin = pipe_sizes.0, stdout = pipe_sizes.1, "pipe sizes");
+
             // used to communicate hopefully utf-8 log messages
             let stderr = child.stderr.take().expect("not taken yet");
             let mut stderr = tokio::io::BufReader::new(stderr);
