@@ -205,6 +205,13 @@ pub enum TaskKind {
 
     // task that handles attaching a tenant
     Attach,
+
+    /// One or more external processes producing pages out of collected [`NeonWalRecord`]s, see
+    /// [`PostgresRedoManager`].
+    ///
+    /// [`NeonWalRecord`]: crate::walrecord::NeonWalRecord
+    /// [`PostgresRedoManager`]: crate::walredo::PostgresRedoManager
+    WalRedo,
 }
 
 #[derive(Default)]

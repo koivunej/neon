@@ -203,7 +203,16 @@ impl PostgresRedoManager {
         // The actual process is launched lazily, on first request.
 
         let (handle, fut) = tokio_postgres_redo(conf, tenant_id, 14);
-        BACKGROUND_RUNTIME.spawn(fut);
+        let h = BACKGROUND_RUNTIME.handle();
+        crate::task_mgr::spawn(
+            h,
+            crate::task_mgr::TaskKind::WalRedo,
+            Some(tenant_id),
+            None,
+            "walredo",
+            true,
+            fut,
+        );
 
         PostgresRedoManager { conf, handle }
     }
@@ -700,7 +709,22 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Ok(first) = rx.recv_async().await {
+        while let Ok(first) = {
+            let recv_next = rx.recv_async();
+            tokio::pin!(recv_next);
+
+            let shutdown = crate::task_mgr::shutdown_watcher();
+            tokio::pin!(shutdown);
+
+            tokio::select! {
+                recv = &mut recv_next => {
+                    recv.map_err(|_| "handle dropped while waiting for first")
+                },
+                _ = shutdown => {
+                    Err("shutdown while waiting for first item")
+                }
+            }
+        } {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -816,8 +840,7 @@ fn tokio_postgres_redo(
                 // the Handle or the request queue sender have been dropped; return Ok(()) to keep
                 // processing any of already pipelined requests
                 Ok(())
-            })
-            .instrument(info_span!("walredo-stdin"));
+            });
 
             #[derive(Debug, thiserror::Error)]
             enum StdoutTaskError {
@@ -977,6 +1000,25 @@ fn tokio_postgres_redo(
             async {
                 // ignore the result, it is always Err from one of the tasks, upon which we stop
                 // advancing the others
+
+                let stdin_task = async {
+                    tokio::pin!(stdin_task);
+
+                    // this assumes that the stdin task runs on the "foreground", it needs to be
+                    // associated with the taskmgr if it moves.
+                    let shutdown = crate::task_mgr::shutdown_watcher();
+                    tokio::pin!(shutdown);
+
+                    tokio::select! {
+                        ret = &mut stdin_task => ret,
+                        _ = &mut shutdown => {
+                            Err("tenant shutdown, cancelling walredo work")
+                        }
+                    }
+                };
+
+                let stdin_task = stdin_task.instrument(info_span!("walredo-stdin"));
+
                 let reason = tokio::try_join!(stdin_task, stdout_task, stderr_task);
 
                 debug!("wal-redo process tasks exited: {reason:?}");
