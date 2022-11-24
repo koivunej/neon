@@ -1024,15 +1024,21 @@ fn tokio_postgres_redo(
 
                 debug!("wal-redo process tasks exited: {reason:?}");
 
-                // dont care if the child has already exited
-                drop(child.start_kill());
+                // only reason why this would fail is that it has exited already, which is
+                // possible by manually killing it outside of pageserver or by it dying while
+                // processing.
+                let killed = child.start_kill().is_ok();
 
                 match child.wait().await {
                     Ok(status) => {
-                        if status.success() {
-                            debug!(?status, "wal-redo process exited successfully");
-                        } else {
-                            warn!(?status, "wal-redo process did not exit successfully");
+                        if !status.success() {
+                            if killed {
+                                // the status will never be success when we kill, at least on unix
+                                debug!(?status, "wal-redo process did not exit successfully as pageserver killed it");
+                            } else {
+                                // situations like killing it from outside manually
+                                warn!(?status, "wal-redo process did not exit successfully but pageserver did not kill it");
+                            };
                         }
                     }
                     Err(e) => {
