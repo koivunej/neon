@@ -23,7 +23,6 @@ def assert_child_processes(pageserver_pid, wal_redo_present=False, defunct_prese
 def test_walredo_not_left_behind_on_detach(neon_env_builder: NeonEnvBuilder):
     env = neon_env_builder.init_start()
     # We intentionally test for a non-existent tenant.
-    env.pageserver.allowed_errors.append(".*Tenant not found.*")
     pageserver_http = env.pageserver.http_client()
 
     pagserver_pid = int((env.repo_dir / "pageserver.pid").read_text())
@@ -32,6 +31,7 @@ def test_walredo_not_left_behind_on_detach(neon_env_builder: NeonEnvBuilder):
 
     # first check for non existing tenant
     tenant_id = TenantId.generate()
+    env.pageserver.allowed_errors.append(f".*Tenant not found for id {tenant_id}\\s*")
     with pytest.raises(
         expected_exception=PageserverApiException,
         match=f"Tenant not found for id {tenant_id}",
