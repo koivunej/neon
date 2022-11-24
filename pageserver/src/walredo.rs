@@ -238,7 +238,8 @@ impl PostgresRedoManager {
         // Relational WAL records are applied using wal-redo-postgres
         let buf_tag = BufferTag { rel, blknum };
 
-        let record_count = records_range.sub_slice(records).len() as u64;
+        let consumed_records = records_range.sub_slice(records);
+        let record_count = consumed_records.len() as u64;
 
         let result = self
             .handle
@@ -253,8 +254,8 @@ impl PostgresRedoManager {
 
         let duration = start_time.elapsed();
 
-        let len = records.len();
-        let nbytes = records.iter().fold(0, |acumulator, record| {
+        let len = record_count;
+        let nbytes = consumed_records.iter().fold(0, |acumulator, record| {
             acumulator
                 + match &record.1 {
                     NeonWalRecord::Postgres { rec, .. } => rec.len(),
