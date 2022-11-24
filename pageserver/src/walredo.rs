@@ -722,7 +722,7 @@ fn tokio_postgres_redo(
                     recv.map_err(|_| "handle dropped while waiting for first")
                 },
                 _ = shutdown => {
-                    Err("shutdown while waiting for first item")
+                    Err("tenant shutdown while waiting for first item")
                 }
             }
         } {
