@@ -485,15 +485,15 @@ impl Timeline {
     /// know anything about them here in the repository.
     #[instrument(skip(self), fields(tenant_id=%self.tenant_id, timeline_id=%self.timeline_id))]
     pub async fn checkpoint(&self, cconf: CheckpointConfig) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| {
+            self.freeze_inmem_layer(false);
+        });
         match cconf {
-            CheckpointConfig::Flush => {
-                self.freeze_inmem_layer(false);
-                self.flush_frozen_layers_and_wait().await
-            }
+            CheckpointConfig::Flush => self.flush_frozen_layers_and_wait().await,
             CheckpointConfig::Forced => {
-                self.freeze_inmem_layer(false);
                 self.flush_frozen_layers_and_wait().await?;
-                self.compact()
+
+                tokio::task::block_in_place(|| self.compact())
             }
         }
     }

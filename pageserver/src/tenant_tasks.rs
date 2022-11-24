@@ -72,7 +72,9 @@ async fn compaction_loop(tenant_id: TenantId) {
                 sleep_duration = Duration::from_secs(10);
             } else {
                 // Run compaction
-                if let Err(e) = tenant.compaction_iteration() {
+                // FIXME: spawn_blocking
+                let res = tokio::task::block_in_place(|| tenant.compaction_iteration());
+                if let Err(e) = res {
                     sleep_duration = wait_duration;
                     error!("Compaction failed, retrying in {:?}: {e:?}", sleep_duration);
                 }

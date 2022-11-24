@@ -67,6 +67,24 @@ macro_rules! failpoint_sleep_millis_async {
     }};
 }
 
+#[macro_export]
+macro_rules! failpoint_sleep_millis {
+    ($name:literal) => {{
+        let should_sleep: Option<std::time::Duration> = (|| {
+            fail::fail_point!($name, |v: Option<_>| {
+                let millis = v.unwrap().parse::<u64>().unwrap();
+                Some(Duration::from_millis(millis))
+            });
+            None
+        })();
+        if let Some(d) = should_sleep {
+            tracing::info!("failpoint {:?}: sleeping for {:?}", $name, d);
+            std::thread::sleep(d);
+            tracing::info!("failpoint {:?}: sleep done", $name);
+        }
+    }};
+}
+
 /// This is a shortcut to embed git sha into binaries and avoid copying the same build script to all packages
 ///
 /// we have several cases:

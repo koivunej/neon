@@ -449,49 +449,55 @@ impl Tenant {
 
         let new_timeline_id = new_timeline_id.unwrap_or_else(TimelineId::generate);
 
-        if self.get_timeline(new_timeline_id, false).is_ok() {
-            debug!("timeline {new_timeline_id} already exists");
-            return Ok(None);
-        }
+        let handle = tokio::runtime::Handle::current();
 
-        let loaded_timeline = match ancestor_timeline_id {
-            Some(ancestor_timeline_id) => {
-                let ancestor_timeline = self
-                    .get_timeline(ancestor_timeline_id, false)
-                    .context("Cannot branch off the timeline that's not present in pageserver")?;
+        // this isn't really an async function, but it does use await
+        tokio::task::block_in_place(|| {
+            if self.get_timeline(new_timeline_id, false).is_ok() {
+                debug!("timeline {new_timeline_id} already exists");
+                return Ok(None);
+            }
 
-                if let Some(lsn) = ancestor_start_lsn.as_mut() {
-                    *lsn = lsn.align();
+            let loaded_timeline = match ancestor_timeline_id {
+                Some(ancestor_timeline_id) => {
+                    let ancestor_timeline =
+                        self.get_timeline(ancestor_timeline_id, false).context(
+                            "Cannot branch off the timeline that's not present in pageserver",
+                        )?;
 
-                    let ancestor_ancestor_lsn = ancestor_timeline.get_ancestor_lsn();
-                    if ancestor_ancestor_lsn > *lsn {
-                        // can we safely just branch from the ancestor instead?
-                        bail!(
+                    if let Some(lsn) = ancestor_start_lsn.as_mut() {
+                        *lsn = lsn.align();
+
+                        let ancestor_ancestor_lsn = ancestor_timeline.get_ancestor_lsn();
+                        if ancestor_ancestor_lsn > *lsn {
+                            // can we safely just branch from the ancestor instead?
+                            bail!(
                             "invalid start lsn {} for ancestor timeline {}: less than timeline ancestor lsn {}",
                             lsn,
                             ancestor_timeline_id,
                             ancestor_ancestor_lsn,
                         );
+                        }
+
+                        // Wait for the WAL to arrive and be processed on the parent branch up
+                        // to the requested branch point. The repository code itself doesn't
+                        // require it, but if we start to receive WAL on the new timeline,
+                        // decoding the new WAL might need to look up previous pages, relation
+                        // sizes etc. and that would get confused if the previous page versions
+                        // are not in the repository yet.
+                        handle.block_on(ancestor_timeline.wait_lsn(*lsn))?;
                     }
 
-                    // Wait for the WAL to arrive and be processed on the parent branch up
-                    // to the requested branch point. The repository code itself doesn't
-                    // require it, but if we start to receive WAL on the new timeline,
-                    // decoding the new WAL might need to look up previous pages, relation
-                    // sizes etc. and that would get confused if the previous page versions
-                    // are not in the repository yet.
-                    ancestor_timeline.wait_lsn(*lsn).await?;
+                    self.branch_timeline(ancestor_timeline_id, new_timeline_id, ancestor_start_lsn)?
                 }
+                None => self.bootstrap_timeline(new_timeline_id, pg_version, &handle)?,
+            };
 
-                self.branch_timeline(ancestor_timeline_id, new_timeline_id, ancestor_start_lsn)?
-            }
-            None => self.bootstrap_timeline(new_timeline_id, pg_version).await?,
-        };
+            // Have added new timeline into the tenant, now its background tasks are needed.
+            self.activate(true);
 
-        // Have added new timeline into the tenant, now its background tasks are needed.
-        self.activate(true);
-
-        Ok(Some(loaded_timeline))
+            Ok(Some(loaded_timeline))
+        })
     }
 
     /// perform one garbage collection iteration, removing old data files from disk.
@@ -519,13 +525,19 @@ impl Tenant {
             .map(|x| x.to_string())
             .unwrap_or_else(|| "-".to_string());
 
-        {
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
             let _timer = STORAGE_TIME
                 .with_label_values(&["gc", &self.tenant_id.to_string(), &timeline_str])
                 .start_timer();
-            self.gc_iteration_internal(target_timeline_id, horizon, pitr, checkpoint_before_gc)
-                .await
-        }
+            self.gc_iteration_internal(
+                target_timeline_id,
+                horizon,
+                pitr,
+                checkpoint_before_gc,
+                &handle,
+            )
+        })
     }
 
     /// Perform one compaction iteration.
@@ -664,6 +676,7 @@ impl Tenant {
                 error!("Ignoring state update {new_state:?} for broken tenant");
             }
             (_, new_state) => {
+                // FIXME: isn't this racy to do this without locking the rwlock for this operation?
                 self.state.send_replace(new_state);
 
                 let timelines_accessor = self.timelines.lock().unwrap();
@@ -999,19 +1012,20 @@ impl Tenant {
     // - if a relation has a non-incremental persistent layer on a child branch, then we
     //   don't need to keep that in the parent anymore. But currently
     //   we do.
-    async fn gc_iteration_internal(
+    fn gc_iteration_internal(
         &self,
         target_timeline_id: Option<TimelineId>,
         horizon: u64,
         pitr: Duration,
         checkpoint_before_gc: bool,
+        handle: &tokio::runtime::Handle,
     ) -> anyhow::Result<GcResult> {
         let mut totals: GcResult = Default::default();
         let now = Instant::now();
 
         let gc_timelines = self.refresh_gc_info_internal(target_timeline_id, horizon, pitr)?;
 
-        utils::failpoint_sleep_millis_async!("gc_iteration_internal_after_getting_gc_timelines");
+        utils::failpoint_sleep_millis!("gc_iteration_internal_after_getting_gc_timelines");
 
         info!("starting on {} timelines", gc_timelines.len());
 
@@ -1036,7 +1050,7 @@ impl Tenant {
             // so that they too can be garbage collected. That's
             // used in tests, so we want as deterministic results as possible.
             if checkpoint_before_gc {
-                timeline.checkpoint(CheckpointConfig::Forced).await?;
+                handle.block_on(timeline.checkpoint(CheckpointConfig::Forced))?;
                 info!(
                     "timeline {} checkpoint_before_gc done",
                     timeline.timeline_id
@@ -1250,10 +1264,11 @@ impl Tenant {
 
     /// - run initdb to init temporary instance and get bootstrap data
     /// - after initialization complete, remove the temp dir.
-    async fn bootstrap_timeline(
+    fn bootstrap_timeline(
         &self,
         timeline_id: TimelineId,
         pg_version: u32,
+        handle: &tokio::runtime::Handle,
     ) -> anyhow::Result<Arc<Timeline>> {
         let timeline_uninit_mark = {
             let timelines = self.timelines.lock().unwrap();
@@ -1287,6 +1302,7 @@ impl Tenant {
                 error!("Failed to remove temporary initdb directory '{}': {}", initdb_path.display(), e);
             }
         }
+
         let pgdata_path = &initdb_path;
         let pgdata_lsn = import_datadir::get_lsn_from_controlfile(pgdata_path)?.align();
 
@@ -1307,15 +1323,16 @@ impl Tenant {
             self.prepare_timeline(timeline_id, new_metadata, timeline_uninit_mark, true, None)?;
 
         let tenant_id = raw_timeline.owning_tenant.tenant_id;
+        assert_eq!(tenant_id, self.tenant_id);
+
         let unfinished_timeline = raw_timeline.raw_timeline()?;
 
-        tokio::task::block_in_place(|| {
-            import_datadir::import_timeline_from_postgres_datadir(
-                unfinished_timeline,
-                pgdata_path,
-                pgdata_lsn,
-            )
-        })
+        let pgdata_path = &initdb_path;
+        import_datadir::import_timeline_from_postgres_datadir(
+            unfinished_timeline,
+            pgdata_path,
+            pgdata_lsn,
+        )
         .with_context(|| {
             format!("Failed to import pgdatadir for timeline {tenant_id}/{timeline_id}")
         })?;
@@ -1330,9 +1347,11 @@ impl Tenant {
             anyhow::bail!("failpoint before-checkpoint-new-timeline");
         });
 
-        unfinished_timeline
+        handle.block_on(async {
+            unfinished_timeline
             .checkpoint(CheckpointConfig::Flush).await
-            .with_context(|| format!("Failed to checkpoint after pgdatadir import for timeline {tenant_id}/{timeline_id}"))?;
+            .with_context(|| format!("Failed to checkpoint after pgdatadir import for timeline {tenant_id}/{timeline_id}"))
+        })?;
 
         let timeline = {
             let mut timelines = self.timelines.lock().unwrap();
