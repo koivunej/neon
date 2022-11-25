@@ -202,7 +202,7 @@ impl PostgresRedoManager {
     pub fn new(conf: &'static PageServerConf, tenant_id: TenantId) -> PostgresRedoManager {
         // The actual process is launched lazily, on first request.
 
-        let (handle, fut) = tokio_postgres_redo(conf, tenant_id, 14);
+        let (handle, fut) = tokio_postgres_redo(conf, tenant_id);
         let h = BACKGROUND_RUNTIME.handle();
         crate::task_mgr::spawn(
             h,
@@ -229,7 +229,7 @@ impl PostgresRedoManager {
         records: &Arc<[(Lsn, NeonWalRecord)]>,
         records_range: SliceRange,
         wal_redo_timeout: Duration,
-        _pg_version: u32,
+        pg_version: u32,
     ) -> Result<Bytes, WalRedoError> {
         let (rel, blknum) = key_to_rel_block(key).or(Err(WalRedoError::InvalidRecord))?;
 
@@ -249,6 +249,7 @@ impl PostgresRedoManager {
                 records: records.clone(),
                 records_range,
                 timeout: wal_redo_timeout,
+                pg_version,
             })
             .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
 
@@ -684,7 +685,6 @@ impl TokioCloseFileDescriptors for tokio::process::Command {
 fn tokio_postgres_redo(
     conf: &'static PageServerConf,
     tenant_id: TenantId,
-    pg_version: u32,
 ) -> (
     Handle,
     impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -729,7 +729,7 @@ fn tokio_postgres_redo(
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
-            let mut child = launch_walredo(conf, tenant_id, pg_version).await?;
+            let mut child = launch_walredo(conf, tenant_id, first.0.pg_version).await?;
             let pid = child
                 .id()
                 .expect("pid is present before killing the process");
@@ -1155,6 +1155,7 @@ struct Request {
     records: Arc<[(Lsn, NeonWalRecord)]>,
     records_range: SliceRange,
     timeout: std::time::Duration,
+    pg_version: u32,
 }
 
 #[derive(Clone)]
