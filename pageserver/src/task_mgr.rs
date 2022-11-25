@@ -47,6 +47,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::task_local;
 
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use once_cell::sync::Lazy;
@@ -237,6 +238,10 @@ struct PageServerTask {
     shutdown_tx: watch::Sender<bool>,
 
     mutable: Mutex<MutableTaskState>,
+
+    /// Cancellation token allows easier tracking of task cancellation than the shutdown_tx, and
+    /// has options for sub-cancellation tokens.
+    token: CancellationToken,
 }
 
 /// Launch a new task
@@ -266,6 +271,7 @@ where
             timeline_id,
             join_handle: None,
         }),
+        token: CancellationToken::new(),
     });
 
     TASKS.lock().unwrap().insert(task_id, Arc::clone(&task));
@@ -416,6 +422,7 @@ pub async fn shutdown_tasks(
                 && (timeline_id.is_none() || task_mut.timeline_id == timeline_id)
             {
                 let _ = task.shutdown_tx.send_replace(true);
+                task.token.cancel();
                 victim_tasks.push(Arc::clone(task));
             }
         }
@@ -455,6 +462,11 @@ pub async fn shutdown_watcher() {
             break;
         }
     }
+}
+
+/// Returns a cancellation token to the current task, if any.
+pub fn cancellation_token() -> Option<CancellationToken> {
+    CURRENT_TASK.try_with(|t| t.token.clone()).ok()
 }
 
 /// Has the current task been requested to shut down?
