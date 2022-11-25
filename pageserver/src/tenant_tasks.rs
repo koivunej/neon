@@ -9,6 +9,7 @@ use crate::metrics::TENANT_TASK_EVENTS;
 use crate::task_mgr::{self, TaskKind, BACKGROUND_RUNTIME};
 use crate::tenant::{Tenant, TenantState};
 use crate::tenant_mgr;
+use anyhow::Context;
 use tracing::*;
 use utils::id::TenantId;
 
@@ -72,8 +73,10 @@ async fn compaction_loop(tenant_id: TenantId) {
                 sleep_duration = Duration::from_secs(10);
             } else {
                 // Run compaction
-                // FIXME: spawn_blocking
-                let res = tokio::task::block_in_place(|| tenant.compaction_iteration());
+                let res = tokio::task::spawn_blocking({
+                    let tenant = Arc::clone(&tenant);
+                    move || tenant.compaction_iteration()
+                }).await.context("spawn_blocking task failure").and_then(|x| x);
                 if let Err(e) = res {
                     sleep_duration = wait_duration;
                     error!("Compaction failed, retrying in {:?}: {e:?}", sleep_duration);
@@ -125,14 +128,21 @@ async fn gc_loop(tenant_id: TenantId) {
                 info!("automatic GC is disabled");
                 // check again in 10 seconds, in case it's been enabled again.
                 sleep_duration = Duration::from_secs(10);
-            } else {
-                // Run gc
-                if gc_horizon > 0 {
-                    if let Err(e) = tenant.gc_iteration(None, gc_horizon, tenant.get_pitr_interval(), false).await
-                    {
-                        sleep_duration = wait_duration;
-                        error!("Gc failed, retrying in {:?}: {e:?}", sleep_duration);
-                    }
+            } else if gc_horizon > 0 {
+                let tenant = Arc::clone(&tenant);
+                let handle = tokio::runtime::Handle::current();
+
+                let res = tokio::task::spawn_blocking(move || {
+                    // gc is actually blocking even though it might do async waits, lets hope this way
+                    // we'll actually block in the blocking pool. any block_in_place will be
+                    // allowed, similarly the blocking thread will be very suitable for waiting on
+                    // wakeups from other tasks.
+                    handle.block_on(tenant.gc_iteration(None, gc_horizon, tenant.get_pitr_interval(), false))
+                }).await.context("spawn_blocking task failure").and_then(|x| x);
+
+                if let Err(e) = res {
+                    sleep_duration = wait_duration;
+                    error!("Gc failed, retrying in {:?}: {e:?}", sleep_duration);
                 }
             }
 
