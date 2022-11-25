@@ -202,8 +202,8 @@ impl PostgresRedoManager {
     pub fn new(conf: &'static PageServerConf, tenant_id: TenantId) -> PostgresRedoManager {
         // The actual process is launched lazily, on first request.
 
-        let (handle, fut) = tokio_postgres_redo(conf, tenant_id);
         let h = BACKGROUND_RUNTIME.handle();
+        let (handle, fut) = tokio_postgres_redo(conf, tenant_id, h);
         crate::task_mgr::spawn(
             h,
             crate::task_mgr::TaskKind::WalRedo,
@@ -685,12 +685,11 @@ impl TokioCloseFileDescriptors for tokio::process::Command {
 fn tokio_postgres_redo(
     conf: &'static PageServerConf,
     tenant_id: TenantId,
+    _handle: &tokio::runtime::Handle,
 ) -> (
     Handle,
     impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 ) {
-    use tokio::io::AsyncWrite;
-
     // precise sizing for this would be pipe size divided by our average redo request
     // theoretically we could fit almost 60 small requests as used in the tests.
     let expected_inflight = 32;
@@ -698,15 +697,6 @@ fn tokio_postgres_redo(
     let (tx, rx) = flume::bounded::<Payload>(expected_inflight);
 
     let ipc = async move {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-
-        let mut buffers = BufQueue::default();
-        let mut scratch = BytesMut::with_capacity(
-            // without vectoring we aim at 3 messages: begin, page, records + get_page,
-            // with vectoring this will be very much enough
-            1024 * 64,
-        );
-
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
@@ -726,358 +716,36 @@ fn tokio_postgres_redo(
                 }
             }
         } {
-            // make sure we dont have anything remaining from a past partial write
-            buffers.clear();
+            let child = launch_walredo(conf, tenant_id, first.0.pg_version).await?;
 
-            let mut child = launch_walredo(conf, tenant_id, first.0.pg_version).await?;
-            let pid = child
-                .id()
-                .expect("pid is present before killing the process");
+            let fut = walredo_rpc(child, rx.clone(), tenant_id, expected_inflight, Some(first));
 
-            info!("Launched wal-redo process for {tenant_id}: {pid}");
+            /*let id = crate::task_mgr::spawn(
+                &handle,
+                crate::task_mgr::TaskKind::WalRedo,
+                Some(tenant_id),
+                None,
+                "walredo-rpc",
+                false,
+                fut,
+            );*/
+            // maybe joinset instead of task_mgr because we lose the ability to wait for tasks, but
+            // need to create a shutdown watcher for each of the spawned so that they get
+            // associated with the tenant.
 
-            // we send the external the request in different commands
-            let mut stdin = child.stdin.take().expect("not taken yet");
-            // stdout is used to communicate the resulting page
-            let mut stdout = child.stdout.take().expect("not taken yet");
+            fut.await;
 
-            #[cfg(not_needed)]
-            {
-                use std::os::unix::io::AsRawFd;
-
-                nix::fcntl::fcntl(
-                    stdout.as_raw_fd(),
-                    nix::fcntl::FcntlArg::F_SETPIPE_SZ(8192 * 4),
-                )
-                .unwrap();
-
-                nix::fcntl::fcntl(
-                    stdin.as_raw_fd(),
-                    nix::fcntl::FcntlArg::F_SETPIPE_SZ(1048576),
-                )
-                .unwrap();
-
-                let pipe_sizes =
-                    nix::fcntl::fcntl(stdin.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ)
-                        .unwrap();
-                let pipe_sizes = (
-                    pipe_sizes,
-                    nix::fcntl::fcntl(stdout.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ)
-                        .unwrap(),
-                );
-
-                debug!(stdin = pipe_sizes.0, stdout = pipe_sizes.1, "pipe sizes");
-            }
-
-            // used to communicate hopefully utf-8 log messages
-            let stderr = child.stderr.take().expect("not taken yet");
-            let mut stderr = tokio::io::BufReader::new(stderr);
-
-            let (result_txs, result_rx) = tokio::sync::mpsc::channel(expected_inflight);
-
-            let have_vectored_stdin = stdin.is_write_vectored();
-
-            let stdin_task = tokio::task::unconstrained(async {
-                let result_txs = result_txs;
-                let mut buffered = Some(first);
-
-                loop {
-                    let (request, response) = {
-                        // TODO: could we somehow manage to keep the request in case we need to
-                        // restart the process? see https://github.com/neondatabase/neon/issues/1700
-                        let next = buffered.take();
-                        let next = if next.is_none() {
-                            rx.recv_async().await.ok()
-                        } else {
-                            next
-                        };
-
-                        match next {
-                            Some(t) => t,
-                            None => break,
-                        }
-                    };
-
-                    let timeout_at = tokio::time::Instant::now() + request.timeout;
-
-                    let records = request.records_range.sub_slice(&request.records);
-
-                    if have_vectored_stdin {
-                        build_vectored_messages(
-                            request.target,
-                            request.base_img,
-                            records,
-                            &mut scratch,
-                            &mut buffers,
-                        );
-                    } else {
-                        build_messages(
-                            request.target,
-                            request.base_img,
-                            records,
-                            &mut scratch,
-                            &mut buffers,
-                        );
-                    }
-
-                    let write_res = async {
-                        while buffers.has_remaining() {
-                            futures::future::poll_fn(|cx| {
-                                tokio_util::io::poll_write_buf(
-                                    std::pin::Pin::new(&mut stdin),
-                                    cx,
-                                    &mut buffers,
-                                )
-                            })
-                            .await
-                            .map_err(anyhow::Error::new)?;
-                        }
-                        Ok::<_, anyhow::Error>(())
-                        // in general flush is not needed, does nothing on pipes
-                        // stdin.flush().await.map_err(anyhow::Error::new)
-                    };
-
-                    let write_res = tokio::time::timeout_at(timeout_at, write_res)
-                        .map_err(|_| anyhow::anyhow!("write timeout"));
-
-                    // wait the write to complete before sending the completion over, since we
-                    // cannot fail the request after it has been moved. this could be worked
-                    // around by making the oneshot into a normal mpsc queue of size 2 and
-                    // making the read side race against the channel closing and timeouted
-                    // read.
-                    match write_res.await.and_then(|x| x) {
-                        Ok(()) => {
-                            if let Err(closed) = result_txs.send((response, timeout_at)).await {
-                                let response = closed.0 .0;
-
-                                drop(
-                                    response
-                                        .send(Err(anyhow::anyhow!("Stdout task closed already"))),
-                                );
-                            }
-                        }
-                        Err(io_or_timeout) => {
-                            drop(response.send(
-                                Err(io_or_timeout).context("Failed to write request to wal-redo"),
-                            ));
-                            // we can still continue processing pipelined requests, if any. the
-                            // stdout task will exit upon seeing we've dropped the result_txs.
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // the Handle or the request queue sender have been dropped; return Ok(()) to keep
-                // processing any of already pipelined requests
-                Ok(())
-            });
-
-            #[derive(Debug, thiserror::Error)]
-            enum StdoutTaskError {
-                #[error("read failed: {0}")]
-                ReadFailed(std::io::Error),
-                #[error("external process stdout was closed")]
-                StdoutClosed,
-                #[error("reading the page timed out")]
-                ReadTimeout,
-            }
-
-            let stdout_task =
-                tokio::task::spawn(
-                    tokio::task::unconstrained(async move {
-                        // TODO: do these pages are put it in a cache? if not, could use a larger buffer
-                        let mut result_rx = result_rx;
-                        let mut page_buf = BytesMut::with_capacity(8192);
-
-                        'out: loop {
-                            let mut read_count = 0;
-
-                            let (res, completion) = {
-
-                                let read_page = async {
-                                    loop {
-                                        read_count += 1;
-                                        let read = stdout
-                                            .read_buf(&mut page_buf)
-                                            .await
-                                            .map_err(StdoutTaskError::ReadFailed)?;
-                                        if read == 0 {
-                                            return Err(StdoutTaskError::StdoutClosed);
-                                        }
-                                        if page_buf.remaining() < 8192 {
-                                            continue;
-                                        }
-                                        let page = page_buf.split().freeze();
-                                        return Ok(page);
-                                    }
-                                };
-
-                                tokio::pin!(read_page);
-
-                                let resp = result_rx.recv();
-
-                                tokio::pin!(resp);
-
-                                let mut page_res = None;
-
-                                let (completion, timeout_at) = loop {
-                                    tokio::select! {
-                                        // use biased to arrange the read and await for read
-                                        // becoming ready as early as possible, as
-                                        // the wait and following wakeup is a major source of
-                                        // delay given the high performance of the walredo
-                                        // process.
-                                        biased;
-
-                                        res = &mut read_page, if page_res.is_none() => {
-                                            page_res = Some(res);
-                                        }
-                                        res = &mut resp => {
-                                            match res {
-                                                Some((completion, timeout_at)) => break (completion, timeout_at),
-                                                None => break 'out,
-                                            }
-                                        }
-                                    }
-                                };
-
-                                let page_res = match page_res {
-                                    Some(res) => res,
-                                    None => {
-                                        // since we did not already complete (as is likely), wrap
-                                        // the read in a timeout now that we know the deadline, and
-                                        // wait for it.
-                                        tokio::time::timeout_at(timeout_at, read_page).await
-                                            .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
-                                            .and_then(|x| x)
-                                    }
-                                };
-
-                                (page_res, completion)
-                            };
-
-                            match res {
-                                Ok(page) => {
-                                    // we don't care about the result, because the caller could be gone
-                                    drop(completion.send(Ok(page)));
-                                    page_buf.reserve(8192);
-                                }
-                                Err(StdoutTaskError::ReadFailed(e)) => {
-                                    drop(completion.send(
-                                        Err(e).context("Failed to read response from wal-redo"),
-                                    ));
-                                    return Err("stdout: read failed");
-                                }
-                                Err(StdoutTaskError::StdoutClosed) => {
-                                    drop(completion.send(Err(anyhow::anyhow!(
-                                        "wal-redo process closed stdout"
-                                    ))));
-                                    return Err(
-                                        "stdout: failed to read from wal-redo: closed stdout",
-                                    );
-                                }
-                                Err(StdoutTaskError::ReadTimeout) => {
-                                    drop(completion.send(Err(anyhow::anyhow!(
-                                        "Timed out while waiting for the page"
-                                    ))));
-                                    return Err("stdout: reading page timed out");
-                                }
-                            }
-                        }
-                        // in a graceful shutdown, this needs to be an Err to take down the stderr task as
-                        // well.
-                        Err::<(), _>("stdout: all requests processed, ready for shutdown")
-                    })
-                    .instrument(info_span!("walredo-stdout")),
-                );
-
-            let stderr_task = tokio::task::spawn(
-                async move {
-                    let mut buffer = Vec::new();
-
-                    loop {
-                        buffer.clear();
-                        match stderr.read_until(b'\n', &mut buffer).await {
-                            Ok(0) => return Err::<(), _>("stderr: closed"),
-                            Ok(read) => {
-                                let message = String::from_utf8_lossy(&buffer[..read]);
-                                error!("wal-redo-process: {}", message.trim());
-                            }
-                            Err(e) => {
-                                error!("reading stderr failed: {e}");
-                                return Err("stderr: read failed");
-                            }
-                        }
-                    }
-                }
-                .instrument(info_span!("walredo-stderr")),
-            );
-
-            use futures::future::TryFutureExt;
-
-            fn join_error_to_str(e: tokio::task::JoinError) -> &'static str {
-                if e.is_cancelled() {
-                    "task was cancelled"
-                } else {
-                    // we most likely have already the stacktrace dump in stderr
-                    "task panicked"
-                }
-            }
-
-            let stdout_task = stdout_task.map_err(join_error_to_str);
-            let stderr_task = stderr_task.map_err(join_error_to_str);
-
-            async {
-                // ignore the result, it is always Err from one of the tasks, upon which we stop
-                // advancing the others
-
-                let stdin_task = async {
-                    tokio::pin!(stdin_task);
-
-                    // this assumes that the stdin task runs on the "foreground", it needs to be
-                    // associated with the taskmgr if it moves.
-                    let shutdown = crate::task_mgr::shutdown_watcher();
-                    tokio::pin!(shutdown);
-
-                    tokio::select! {
-                        ret = &mut stdin_task => ret,
-                        _ = &mut shutdown => {
-                            Err("tenant shutdown, cancelling walredo work")
-                        }
-                    }
-                };
-
-                let stdin_task = stdin_task.instrument(info_span!("walredo-stdin"));
-
-                let reason = tokio::try_join!(stdin_task, stdout_task, stderr_task);
-
-                debug!("wal-redo process tasks exited: {reason:?}");
-
-                // only reason why this would fail is that it has exited already, which is
-                // possible by manually killing it outside of pageserver or by it dying while
-                // processing.
-                let killed = child.start_kill().is_ok();
-
-                match child.wait().await {
-                    Ok(status) => {
-                        if !status.success() {
-                            if killed {
-                                // the status will never be success when we kill, at least on unix
-                                debug!(?status, "wal-redo process did not exit successfully as pageserver killed it");
-                            } else {
-                                // situations like killing it from outside manually
-                                warn!(?status, "wal-redo process did not exit successfully but pageserver did not kill it");
-                            };
-                        }
-                    }
-                    Err(e) => {
-                        error!("failed to wait for child process to exit: {e}");
-                    }
-                }
-                info!("wal-redo task exiting");
-            }
-            .instrument(info_span!("wal-redo", pid, %tenant_id))
-            .await;
+            // so what to do then if multiprocess? for multi process support we need to:
+            //
+            // - lower the expected_inflight to 4-8 -- it is currently enough to fill 1MB pipe
+            // - use result_tx being full or writes bouncing to mean that we might need more processes
+            // - wait here for such notifications, eventually spawn more processes
+            //
+            // then the stdin loop will need to start reserving result_tx slot at the end of each
+            // round, to spread the tasks evenly..
+            //
+            // insert control loop here; maybe have an Arc of all inflight requests, watch it
+            // periodically..? or just have a an atomic of how many tasks are full.
         }
 
         Ok(())
@@ -1086,6 +754,7 @@ fn tokio_postgres_redo(
     (Handle { tx }, ipc)
 }
 
+#[instrument(skip(conf))]
 async fn launch_walredo(
     conf: &PageServerConf,
     tenant_id: TenantId,
@@ -1096,10 +765,10 @@ async fn launch_walredo(
         TEMP_FILE_SUFFIX,
     );
 
-    info!("removing existing data directory: {}", datadir.display());
-
     match tokio::fs::remove_dir_all(&datadir).await {
-        Ok(()) => {}
+        Ok(()) => {
+            info!("removed existing data directory: {}", datadir.display());
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         other => other.with_context(|| {
             format!(
@@ -1149,6 +818,384 @@ async fn launch_walredo(
         .kill_on_drop(true)
         .spawn()
         .context("postgres --wal-redo command failed to start")
+}
+
+async fn walredo_rpc(
+    mut child: tokio::process::Child,
+    work_rx: flume::Receiver<Payload>,
+    tenant_id: TenantId,
+    expected_inflight: usize,
+    initial: Option<Payload>,
+) {
+    let pid = child
+        .id()
+        .expect("pid is present before killing the process");
+
+    info!("Launched wal-redo process for {tenant_id}: {pid}");
+
+    // we send the external the request in different commands
+    let stdin = child.stdin.take().expect("not taken yet");
+
+    // stdout is used to communicate the resulting page
+    let stdout = child.stdout.take().expect("not taken yet");
+
+    #[cfg(not_needed)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        nix::fcntl::fcntl(
+            stdout.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETPIPE_SZ(8192 * 4),
+        )
+        .unwrap();
+
+        nix::fcntl::fcntl(
+            stdin.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETPIPE_SZ(1048576),
+        )
+        .unwrap();
+
+        let pipe_sizes =
+            nix::fcntl::fcntl(stdin.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ).unwrap();
+        let pipe_sizes = (
+            pipe_sizes,
+            nix::fcntl::fcntl(stdout.as_raw_fd(), nix::fcntl::FcntlArg::F_GETPIPE_SZ).unwrap(),
+        );
+
+        debug!(stdin = pipe_sizes.0, stdout = pipe_sizes.1, "pipe sizes");
+    }
+
+    // used to communicate hopefully utf-8 log messages
+    let stderr = child.stderr.take().expect("not taken yet");
+
+    let (result_txs, result_rx) = tokio::sync::mpsc::channel(expected_inflight);
+
+    let stdin_task = stdin_task(stdin, work_rx, result_txs, initial);
+
+    let shutdown = crate::task_mgr::shutdown_watcher();
+
+    let stdin_task = async {
+        tokio::pin!(stdin_task);
+
+        tokio::pin!(shutdown);
+
+        // because stdin and stdout are interconnected with a channel to faciliate
+        // pipelining, we don't need to cancel all of the tasks, just the "feeder" task.
+        //
+        // using tokio::try_join! later we get the wanted "channel close or shutdown takes
+        // down all tasks after finishing the in-flight work"
+        tokio::select! {
+            ret = &mut stdin_task => ret,
+            _ = &mut shutdown => {
+                // instead of cancelling all of the tasks at once by:
+                //
+                // Err("tenant shutdown, cancelling walredo work")
+                //
+                // just "close" channel connecting stdin and stdout tasks so that
+                // whatever got through, will be processed.
+                //
+                // walredo process might end up seeing one more request we will not
+                // read the response to, but it's most likely killed at that point
+                // anyways.
+                Ok(())
+            }
+        }
+    };
+
+    let stdout_task = stdout_task(stdout, result_rx);
+
+    let stderr_task = stderr_task(stderr);
+
+    async move {
+        // changed during splitting this up: run all in current task.
+        let reason = tokio::try_join!(stdin_task, stdout_task, stderr_task);
+        debug!("wal-redo process tasks exited: {reason:?}");
+
+        // only reason why this would fail is that it has exited already, which is
+        // possible by manually killing it outside of pageserver or by it dying while
+        // processing.
+        let killed = child.start_kill().is_ok();
+
+        match child.wait().await {
+            Ok(status) => {
+                if !status.success() {
+                    if killed {
+                        // the status will never be success when we kill, at least on unix
+                        debug!(?status, "wal-redo process did not exit successfully as pageserver killed it");
+                    } else {
+                        // situations like killing it from outside manually
+                        warn!(?status, "wal-redo process did not exit successfully but pageserver did not kill it");
+                    };
+                }
+            }
+            Err(e) => {
+                error!("failed to wait for child process to exit: {e}");
+            }
+        }
+        info!("task exiting");
+    }
+    .instrument(info_span!("wal-redo", pid, %tenant_id))
+    .await
+}
+
+/// Payload from stdin task to stdout task for completion
+type IntermediatePayload = (flume::Sender<anyhow::Result<Bytes>>, tokio::time::Instant);
+
+/// Returns a human readable reason for stopping. Channel being closed is turned into `Ok(())`.
+#[instrument(name = "stdin", skip_all)]
+async fn stdin_task<AW>(
+    mut stdin: AW,
+    work_rx: flume::Receiver<Payload>,
+    result_txs: tokio::sync::mpsc::Sender<IntermediatePayload>,
+    mut initial: Option<Payload>,
+) -> Result<(), &'static str>
+where
+    AW: tokio::io::AsyncWrite + Unpin,
+{
+    use futures::future::{poll_fn, TryFutureExt};
+    use std::pin::Pin;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::io::poll_write_buf;
+
+    let mut buffers = BufQueue::default();
+    let mut scratch = BytesMut::with_capacity(
+        // without vectoring we aim at 3 messages: begin, page, records + get_page,
+        // with vectoring this will be very much enough
+        1024 * 64,
+    );
+
+    let have_vectored_stdin = stdin.is_write_vectored();
+
+    loop {
+        let (request, response) = {
+            // TODO: could we somehow manage to keep the request in case we need to
+            // restart the process? see https://github.com/neondatabase/neon/issues/1700
+            let next = initial.take();
+            let next = if next.is_none() {
+                // shutdown is handled outside of this task
+                work_rx.recv_async().await.ok()
+            } else {
+                next
+            };
+
+            match next {
+                Some(t) => t,
+                None => {
+                    // the Handle or the request queue sender have been dropped; return Ok(()) to keep
+                    // processing any of already pipelined requests.
+                    //
+                    // the drop however does never seem to happen, but most likely the task is
+                    // descheduled because of a shutdown_watcher.
+                    return Ok(());
+                }
+            }
+        };
+
+        let timeout_at = tokio::time::Instant::now() + request.timeout;
+
+        let records = request.records_range.sub_slice(&request.records);
+
+        if have_vectored_stdin {
+            build_vectored_messages(
+                request.target,
+                request.base_img,
+                records,
+                &mut scratch,
+                &mut buffers,
+            );
+        } else {
+            build_messages(
+                request.target,
+                request.base_img,
+                records,
+                &mut scratch,
+                &mut buffers,
+            );
+        }
+
+        let write_res = async {
+            while buffers.has_remaining() {
+                poll_fn(|cx| poll_write_buf(Pin::new(&mut stdin), cx, &mut buffers))
+                    .await
+                    .map_err(anyhow::Error::new)?;
+            }
+            // in general flush is not needed, does nothing on pipes, but since we now accept
+            // AsyncWrite
+            stdin.flush().await.map_err(anyhow::Error::new)
+        };
+
+        let write_res = tokio::time::timeout_at(timeout_at, write_res)
+            .map_err(|_| anyhow::anyhow!("write timeout"));
+
+        // wait the write to complete before sending the completion over, because we cannot fail
+        // the request after it has been moved. this could be worked around by making the oneshot
+        // into a normal mpsc queue of size 2 and making the read side race against the channel
+        // closing and timeouted read.
+        match write_res.await.and_then(|x| x) {
+            Ok(()) => {
+                // by writing and then completing later we achieve request pipelining with the
+                // walredo process. some workloads fit well into the default 64KB buffer, so we
+                // have an opportunity to keep walredo busy by buffering the requests.
+                if let Err(closed) = result_txs.send((response, timeout_at)).await {
+                    let response = closed.0 .0;
+
+                    drop(response.send(Err(anyhow::anyhow!("Stdout task closed already"))));
+                }
+            }
+            Err(io_or_timeout) => {
+                drop(
+                    response
+                        .send(Err(io_or_timeout).context("Failed to write request to wal-redo")),
+                );
+                // we can still continue processing pipelined requests, if any. the
+                // stdout task will exit upon seeing we've dropped the result_txs.
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Always eventually fails, returning a developer friendly reason.
+#[instrument(name = "stdout", skip_all)]
+async fn stdout_task<AR>(
+    mut stdout: AR,
+    result_rx: tokio::sync::mpsc::Receiver<IntermediatePayload>,
+) -> Result<(), &'static str>
+where
+    AR: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    #[derive(Debug)]
+    enum StdoutTaskError {
+        ReadFailed(std::io::Error),
+        StdoutClosed,
+        ReadTimeout,
+    }
+
+    async fn read_page<AR>(mut stdout: AR, buffer: &mut BytesMut) -> Result<Bytes, StdoutTaskError>
+    where
+        AR: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            let read = stdout
+                .read_buf(buffer)
+                .await
+                .map_err(StdoutTaskError::ReadFailed)?;
+            if read == 0 {
+                return Err(StdoutTaskError::StdoutClosed);
+            }
+            if buffer.remaining() < 8192 {
+                continue;
+            }
+            let page = buffer.split().freeze();
+            return Ok(page);
+        }
+    }
+
+    // TODO: do these pages are put it in a cache? if not, could use a larger buffer
+    let mut result_rx = result_rx;
+    let mut page_buf = BytesMut::with_capacity(8192);
+
+    loop {
+        let (res, completion) = {
+            let read_page = read_page(&mut stdout, &mut page_buf);
+            tokio::pin!(read_page);
+
+            let resp = result_rx.recv();
+            tokio::pin!(resp);
+
+            let mut page_res = None;
+
+            let (completion, timeout_at) = loop {
+                tokio::select! {
+                    // use biased to arrange the read and await for read
+                    // becoming ready as early as possible, as
+                    // the wait and following wakeup is a major source of
+                    // delay given the high performance of the walredo
+                    // process.
+                    biased;
+
+                    res = &mut read_page, if page_res.is_none() => {
+                        page_res = Some(res);
+                    }
+
+                    res = &mut resp => {
+                        match res {
+                            Some((completion, timeout_at)) => break (completion, timeout_at),
+                            None => {
+                                // in a graceful shutdown, this needs to be an Err to take down the stderr task as
+                                // well.
+                                return Err::<(), _>("stdout: all requests processed, ready for shutdown")
+                            },
+                        }
+                    }
+                }
+            };
+
+            let page_res = match page_res {
+                Some(res) => res,
+                None => {
+                    // since we did not already complete (as is likely), wrap
+                    // the read in a timeout now that we know the deadline, and
+                    // wait for it.
+                    tokio::time::timeout_at(timeout_at, read_page)
+                        .await
+                        .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
+                        .and_then(|x| x)
+                }
+            };
+
+            (page_res, completion)
+        };
+
+        match res {
+            Ok(page) => {
+                // we don't care about the result, because the caller could be gone
+                drop(completion.send(Ok(page)));
+                page_buf.reserve(8192);
+            }
+            Err(StdoutTaskError::ReadFailed(e)) => {
+                drop(completion.send(Err(e).context("Failed to read response from wal-redo")));
+                return Err("stdout: read failed");
+            }
+            Err(StdoutTaskError::StdoutClosed) => {
+                drop(completion.send(Err(anyhow::anyhow!("wal-redo process closed stdout"))));
+                return Err("stdout: failed to read from wal-redo: closed stdout");
+            }
+            Err(StdoutTaskError::ReadTimeout) => {
+                drop(completion.send(Err(anyhow::anyhow!("Timed out while waiting for the page"))));
+                return Err("stdout: reading page timed out");
+            }
+        }
+    }
+}
+
+#[instrument(name = "stderr", skip_all)]
+async fn stderr_task<AR>(stderr: AR) -> Result<(), &'static str>
+where
+    AR: tokio::io::AsyncRead,
+{
+    use tokio::io::AsyncBufReadExt;
+    let stderr = tokio::io::BufReader::new(stderr);
+    let mut buffer = Vec::new();
+
+    tokio::pin!(stderr);
+
+    loop {
+        buffer.clear();
+        match stderr.read_until(b'\n', &mut buffer).await {
+            Ok(0) => return Err::<(), _>("stderr: closed"),
+            Ok(read) => {
+                let message = String::from_utf8_lossy(&buffer[..read]);
+                error!("wal-redo-process: {}", message.trim());
+            }
+            Err(e) => {
+                warn!("reading stderr failed: {e}");
+                return Err("stderr: read failed");
+            }
+        }
+    }
 }
 
 type Payload = (Request, flume::Sender<anyhow::Result<Bytes>>);
@@ -1237,6 +1284,7 @@ impl BufQueue {
         }
     }
 
+    #[allow(unused)]
     fn clear(&mut self) {
         self.bufs.clear();
         self.remaining = 0;
