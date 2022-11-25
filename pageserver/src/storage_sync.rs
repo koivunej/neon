@@ -704,7 +704,8 @@ async fn storage_sync_loop(
     loop {
         let loop_storage = storage.clone();
 
-        let (batched_tasks, remaining_queue_length) = sync_queue.next_task_batch();
+        let (batched_tasks, remaining_queue_length) =
+            tokio::task::block_in_place(|| sync_queue.next_task_batch());
 
         if task_mgr::is_shutdown_requested() {
             info!("Shutdown requested, stopping");
