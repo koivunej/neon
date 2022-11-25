@@ -107,6 +107,8 @@ async fn gc_loop(tenant_id: TenantId) {
     info!("starting");
     TENANT_TASK_EVENTS.with_label_values(&["start"]).inc();
     async {
+        let cancel = task_mgr::cancellation_token().expect("in taskmgr registered task");
+
         loop {
             trace!("waking up");
 
@@ -131,13 +133,14 @@ async fn gc_loop(tenant_id: TenantId) {
             } else if gc_horizon > 0 {
                 let tenant = Arc::clone(&tenant);
                 let handle = tokio::runtime::Handle::current();
+                let cancel = cancel.clone();
 
                 let res = tokio::task::spawn_blocking(move || {
                     // gc is actually blocking even though it might do async waits, lets hope this way
                     // we'll actually block in the blocking pool. any block_in_place will be
                     // allowed, similarly the blocking thread will be very suitable for waiting on
                     // wakeups from other tasks.
-                    handle.block_on(tenant.gc_iteration(None, gc_horizon, tenant.get_pitr_interval(), false))
+                    handle.block_on(tenant.gc_iteration(None, gc_horizon, tenant.get_pitr_interval(), false, cancel))
                 }).await.context("spawn_blocking task failure").and_then(|x| x);
 
                 if let Err(e) = res {

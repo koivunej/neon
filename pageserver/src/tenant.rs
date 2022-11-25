@@ -18,6 +18,7 @@ use pageserver_api::models::TimelineState;
 use tokio::sync::watch;
 use tokio_util::io::StreamReader;
 use tokio_util::io::SyncIoBridge;
+use tokio_util::sync::CancellationToken;
 use tracing::*;
 use utils::crashsafe::path_with_suffix_extension;
 
@@ -47,7 +48,6 @@ use crate::import_datadir;
 use crate::metrics::{remove_tenant_metrics, STORAGE_TIME};
 use crate::repository::GcResult;
 use crate::storage_sync::index::RemoteIndex;
-use crate::task_mgr;
 use crate::tenant_config::TenantConfOpt;
 use crate::virtual_file::VirtualFile;
 use crate::walredo::WalRedoManager;
@@ -515,6 +515,7 @@ impl Tenant {
         horizon: u64,
         pitr: Duration,
         checkpoint_before_gc: bool,
+        cancel: CancellationToken,
     ) -> anyhow::Result<GcResult> {
         anyhow::ensure!(
             self.is_active(),
@@ -536,6 +537,7 @@ impl Tenant {
                 pitr,
                 checkpoint_before_gc,
                 &handle,
+                cancel,
             )
         })
     }
@@ -1019,6 +1021,7 @@ impl Tenant {
         pitr: Duration,
         checkpoint_before_gc: bool,
         handle: &tokio::runtime::Handle,
+        cancel: CancellationToken,
     ) -> anyhow::Result<GcResult> {
         let mut totals: GcResult = Default::default();
         let now = Instant::now();
@@ -1040,7 +1043,7 @@ impl Tenant {
         // See comments in [`Tenant::branch_timeline`] for more information
         // about why branch creation task can run concurrently with timeline's GC iteration.
         for timeline in gc_timelines {
-            if task_mgr::is_shutdown_requested() {
+            if cancel.is_cancelled() {
                 // We were requested to shut down. Stop and return with the progress we
                 // made.
                 break;
@@ -1861,6 +1864,7 @@ mod tests {
     use hex_literal::hex;
     use once_cell::sync::Lazy;
     use rand::{thread_rng, Rng};
+    use tokio_util::sync::CancellationToken;
 
     static TEST_KEY: Lazy<Key> =
         Lazy::new(|| Key::from_slice(&hex!("112222222233333333444444445500000001")));
@@ -2017,6 +2021,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_prohibit_branch_creation_on_garbage_collected_data() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
         let tenant =
             TenantHarness::create("test_prohibit_branch_creation_on_garbage_collected_data")?
                 .load();
@@ -2030,7 +2035,7 @@ mod tests {
         // and compaction works. But it does set the 'cutoff' point so that the cross check
         // below should fail.
         tenant
-            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false)
+            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false, cancel)
             .await?;
 
         // try to branch at lsn 25, should fail because we already garbage collected the data
@@ -2098,6 +2103,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_retain_data_in_parent_which_is_needed_for_child() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
         let tenant =
             TenantHarness::create("test_retain_data_in_parent_which_is_needed_for_child")?.load();
         let tline = tenant
@@ -2111,7 +2117,7 @@ mod tests {
             .expect("Should have a local timeline");
         // this removes layers before lsn 40 (50 minus 10), so there are two remaining layers, image and delta for 31-50
         tenant
-            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false)
+            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false, cancel)
             .await?;
         assert!(newtline.get(*TEST_KEY, Lsn(0x25)).is_ok());
 
@@ -2120,6 +2126,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_parent_keeps_data_forever_after_branching() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
         let tenant =
             TenantHarness::create("test_parent_keeps_data_forever_after_branching")?.load();
         let tline = tenant
@@ -2136,7 +2143,7 @@ mod tests {
 
         // run gc on parent
         tenant
-            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false)
+            .gc_iteration(Some(TIMELINE_ID), 0x10, Duration::ZERO, false, cancel)
             .await?;
 
         // Check that the data is still accessible on the branch.

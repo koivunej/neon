@@ -842,8 +842,10 @@ async fn timeline_gc_handler(mut request: Request<Body>) -> Result<Response<Body
 
     // Use tenant's pitr setting
     let pitr = tenant.get_pitr_interval();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _g = cancel.clone().drop_guard();
     let result = tenant
-        .gc_iteration(Some(timeline_id), gc_horizon, pitr, true)
+        .gc_iteration(Some(timeline_id), gc_horizon, pitr, true, cancel)
         .instrument(info_span!("manual_gc", tenant = %tenant_id, timeline = %timeline_id))
         .await
         // FIXME: `gc_iteration` can return an error for multiple reasons; we should handle it
