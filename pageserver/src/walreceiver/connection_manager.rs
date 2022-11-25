@@ -961,7 +961,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn connection_no_candidate() -> anyhow::Result<()> {
         let harness = TenantHarness::create("connection_no_candidate")?;
         let mut state = dummy_state(&harness);
@@ -1173,7 +1173,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn candidate_with_many_connection_failures() -> anyhow::Result<()> {
         let harness = TenantHarness::create("candidate_with_many_connection_failures")?;
         let mut state = dummy_state(&harness);
@@ -1241,7 +1241,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn lsn_wal_over_threshhold_current_candidate() -> anyhow::Result<()> {
         let harness = TenantHarness::create("lsn_wal_over_threshcurrent_candidate")?;
         let mut state = dummy_state(&harness);
@@ -1333,7 +1333,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn timeout_connection_threshhold_current_candidate() -> anyhow::Result<()> {
         let harness = TenantHarness::create("timeout_connection_threshhold_current_candidate")?;
         let mut state = dummy_state(&harness);
@@ -1408,7 +1408,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn timeout_wal_over_threshhold_current_candidate() -> anyhow::Result<()> {
         let harness = TenantHarness::create("timeout_wal_over_threshhold_current_candidate")?;
         let mut state = dummy_state(&harness);

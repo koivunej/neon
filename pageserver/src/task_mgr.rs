@@ -274,25 +274,27 @@ where
         token: CancellationToken::new(),
     });
 
-    TASKS.lock().unwrap().insert(task_id, Arc::clone(&task));
+    tokio::task::block_in_place(|| {
+        TASKS.lock().unwrap().insert(task_id, Arc::clone(&task));
 
-    let mut task_mut = task.mutable.lock().unwrap();
+        let mut task_mut = task.mutable.lock().unwrap();
 
-    let task_name = name.to_string();
-    let task_cloned = Arc::clone(&task);
-    let join_handle = runtime.spawn(task_wrapper(
-        task_name,
-        task_id,
-        task_cloned,
-        shutdown_rx,
-        shutdown_process_on_error,
-        future,
-    ));
-    task_mut.join_handle = Some(join_handle);
-    drop(task_mut);
+        let task_name = name.to_string();
+        let task_cloned = Arc::clone(&task);
+        let join_handle = runtime.spawn(task_wrapper(
+            task_name,
+            task_id,
+            task_cloned,
+            shutdown_rx,
+            shutdown_process_on_error,
+            future,
+        ));
+        task_mut.join_handle = Some(join_handle);
+        drop(task_mut);
 
-    // The task is now running. Nothing more to do here
-    PageserverTaskId(task_id)
+        // The task is now running. Nothing more to do here
+        PageserverTaskId(task_id)
+    })
 }
 
 /// This wrapper function runs in a newly-spawned task. It initializes the
@@ -411,9 +413,9 @@ pub async fn shutdown_tasks(
     tenant_id: Option<TenantId>,
     timeline_id: Option<TimelineId>,
 ) {
-    let mut victim_tasks = Vec::new();
-
-    {
+    // FIXME: rewrite this with futures unordered
+    tokio::task::block_in_place(|| {
+        let mut victim_tasks = Vec::new();
         let tasks = TASKS.lock().unwrap();
         for task in tasks.values() {
             let task_mut = task.mutable.lock().unwrap();
@@ -426,24 +428,29 @@ pub async fn shutdown_tasks(
                 victim_tasks.push(Arc::clone(task));
             }
         }
-    }
 
-    for task in victim_tasks {
-        let join_handle = {
-            let mut task_mut = task.mutable.lock().unwrap();
-            info!("waiting for {} to shut down", task.name);
-            let join_handle = task_mut.join_handle.take();
-            drop(task_mut);
-            join_handle
-        };
-        if let Some(join_handle) = join_handle {
-            let _ = join_handle.await;
-        } else {
-            // Possibly one of:
-            //  * The task had not even fully started yet.
-            //  * It was shut down concurrently and already exited
+        // this will not panic, because we were called in from async context, we will get the
+        // handle to the runtime we blocked in place
+        let handle = tokio::runtime::Handle::current();
+
+        for task in victim_tasks {
+            let join_handle = {
+                // FIXME: this locking is not needed, name could be cloned within the first.
+                let mut task_mut = task.mutable.lock().unwrap();
+                info!("waiting for {} to shut down", task.name);
+                let join_handle = task_mut.join_handle.take();
+                drop(task_mut);
+                join_handle
+            };
+            if let Some(join_handle) = join_handle {
+                let _ = handle.block_on(join_handle);
+            } else {
+                // Possibly one of:
+                //  * The task had not even fully started yet.
+                //  * It was shut down concurrently and already exited
+            }
         }
-    }
+    });
 }
 
 pub fn current_task_kind() -> Option<TaskKind> {
