@@ -2015,7 +2015,7 @@ mod tests {
         tline.checkpoint(CheckpointConfig::Forced).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_prohibit_branch_creation_on_garbage_collected_data() -> anyhow::Result<()> {
         let tenant =
             TenantHarness::create("test_prohibit_branch_creation_on_garbage_collected_data")?
@@ -2096,7 +2096,7 @@ mod tests {
     }
      */
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_retain_data_in_parent_which_is_needed_for_child() -> anyhow::Result<()> {
         let tenant =
             TenantHarness::create("test_retain_data_in_parent_which_is_needed_for_child")?.load();
@@ -2117,7 +2117,8 @@ mod tests {
 
         Ok(())
     }
-    #[tokio::test]
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_parent_keeps_data_forever_after_branching() -> anyhow::Result<()> {
         let tenant =
             TenantHarness::create("test_parent_keeps_data_forever_after_branching")?.load();
@@ -2147,7 +2148,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn timeline_load() -> anyhow::Result<()> {
         const TEST_NAME: &str = "timeline_load";
         let harness = TenantHarness::create(TEST_NAME)?;
@@ -2168,7 +2169,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn timeline_load_with_ancestor() -> anyhow::Result<()> {
         const TEST_NAME: &str = "timeline_load_with_ancestor";
         let harness = TenantHarness::create(TEST_NAME)?;
@@ -2249,7 +2250,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_images() -> anyhow::Result<()> {
         let tenant = TenantHarness::create("test_images")?.load();
         let tline = tenant
@@ -2301,7 +2302,7 @@ mod tests {
     // Insert 1000 key-value pairs with increasing keys, checkpoint,
     // repeat 50 times.
     //
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_bulk_insert() -> anyhow::Result<()> {
         let tenant = TenantHarness::create("test_bulk_insert")?.load();
         let tline = tenant
@@ -2343,7 +2344,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_random_updates() -> anyhow::Result<()> {
         let tenant = TenantHarness::create("test_random_updates")?.load();
         let tline = tenant
@@ -2415,7 +2416,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_traverse_branches() -> anyhow::Result<()> {
         let tenant = TenantHarness::create("test_traverse_branches")?.load();
         let mut tline = tenant
