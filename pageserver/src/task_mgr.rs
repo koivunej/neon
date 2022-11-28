@@ -335,11 +335,13 @@ async fn task_finish(
     shutdown_process_on_error: bool,
 ) {
     // Remove our entry from the global hashmap.
-    let task = TASKS
-        .lock()
-        .unwrap()
-        .remove(&task_id)
-        .expect("no task in registry");
+    let task = tokio::task::block_in_place(|| {
+        TASKS
+            .lock()
+            .unwrap()
+            .remove(&task_id)
+            .expect("no task in registry")
+    });
 
     let mut shutdown_process = false;
     {
