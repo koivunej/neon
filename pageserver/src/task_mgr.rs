@@ -276,25 +276,25 @@ where
 
     tokio::task::block_in_place(|| {
         TASKS.lock().unwrap().insert(task_id, Arc::clone(&task));
+    });
 
-        let mut task_mut = task.mutable.lock().unwrap();
+    let mut task_mut = task.mutable.lock().unwrap();
 
-        let task_name = name.to_string();
-        let task_cloned = Arc::clone(&task);
-        let join_handle = runtime.spawn(task_wrapper(
-            task_name,
-            task_id,
-            task_cloned,
-            shutdown_rx,
-            shutdown_process_on_error,
-            future,
-        ));
-        task_mut.join_handle = Some(join_handle);
-        drop(task_mut);
+    let task_name = name.to_string();
+    let task_cloned = Arc::clone(&task);
+    let join_handle = runtime.spawn(task_wrapper(
+        task_name,
+        task_id,
+        task_cloned,
+        shutdown_rx,
+        shutdown_process_on_error,
+        future,
+    ));
+    task_mut.join_handle = Some(join_handle);
+    drop(task_mut);
 
-        // The task is now running. Nothing more to do here
-        PageserverTaskId(task_id)
-    })
+    // The task is now running. Nothing more to do here
+    PageserverTaskId(task_id)
 }
 
 /// This wrapper function runs in a newly-spawned task. It initializes the
