@@ -418,16 +418,18 @@ pub async fn shutdown_tasks(
     // FIXME: rewrite this with futures unordered
     tokio::task::block_in_place(|| {
         let mut victim_tasks = Vec::new();
-        let tasks = TASKS.lock().unwrap();
-        for task in tasks.values() {
-            let task_mut = task.mutable.lock().unwrap();
-            if (kind.is_none() || Some(task.kind) == kind)
-                && (tenant_id.is_none() || task_mut.tenant_id == tenant_id)
-                && (timeline_id.is_none() || task_mut.timeline_id == timeline_id)
-            {
-                let _ = task.shutdown_tx.send_replace(true);
-                task.token.cancel();
-                victim_tasks.push(Arc::clone(task));
+        {
+            let tasks = TASKS.lock().unwrap();
+            for task in tasks.values() {
+                let task_mut = task.mutable.lock().unwrap();
+                if (kind.is_none() || Some(task.kind) == kind)
+                    && (tenant_id.is_none() || task_mut.tenant_id == tenant_id)
+                    && (timeline_id.is_none() || task_mut.timeline_id == timeline_id)
+                {
+                    let _ = task.shutdown_tx.send_replace(true);
+                    task.token.cancel();
+                    victim_tasks.push(Arc::clone(task));
+                }
             }
         }
 
