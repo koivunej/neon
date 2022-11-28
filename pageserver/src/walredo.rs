@@ -1073,7 +1073,7 @@ where
         ReadTimeout,
     }
 
-    async fn read_page<AR>(mut stdout: AR, buffer: &mut BytesMut) -> Result<Bytes, StdoutTaskError>
+    async fn read_page<AR>(mut stdout: AR, buffer: &mut Vec<u8>) -> Result<(), StdoutTaskError>
     where
         AR: tokio::io::AsyncRead + Unpin,
     {
@@ -1085,17 +1085,19 @@ where
             if read == 0 {
                 return Err(StdoutTaskError::StdoutClosed);
             }
-            if buffer.remaining() < 8192 {
+            if buffer.len() < 8192 {
                 continue;
             }
-            let page = buffer.split().freeze();
-            return Ok(page);
+            return Ok(());
         }
     }
 
     // TODO: do these pages are put it in a cache? if not, could use a larger buffer
     let mut result_rx = result_rx;
-    let mut page_buf = BytesMut::with_capacity(8192);
+
+    // the +1 is for normally reading and clearing out the readyness for the stdout. tokio does not
+    // expose an api for this, so we need to have this "hack". this buffer is reused between reads.
+    let mut page_buf = Vec::with_capacity(8192 + 1);
 
     loop {
         let (res, completion) = {
@@ -1114,6 +1116,9 @@ where
                     // the wait and following wakeup is a major source of
                     // delay given the high performance of the walredo
                     // process.
+                    //
+                    // FIXME: this comment and/or biased should be outdated by doing the readiness
+                    // clearing reads.
                     biased;
 
                     res = &mut read_page, if page_res.is_none() => {
@@ -1150,10 +1155,13 @@ where
         };
 
         match res {
-            Ok(page) => {
+            Ok(()) => {
+                let page = Bytes::copy_from_slice(&page_buf[..8192]);
                 // we don't care about the result, because the caller could be gone
                 drop(completion.send(Ok(page)));
-                page_buf.reserve(8192);
+                // if we did read more than one page, drain will move the one byte to the front, so we
+                // can continue with that next round.
+                page_buf.drain(..8192);
             }
             Err(StdoutTaskError::ReadFailed(e)) => {
                 drop(completion.send(Err(e).context("Failed to read response from wal-redo")));
