@@ -1100,59 +1100,15 @@ where
     let mut page_buf = Vec::with_capacity(8192 + 1);
 
     loop {
-        let (res, completion) = {
-            let read_page = read_page(&mut stdout, &mut page_buf);
-            tokio::pin!(read_page);
-
-            let resp = result_rx.recv();
-            tokio::pin!(resp);
-
-            let mut page_res = None;
-
-            let (completion, timeout_at) = loop {
-                tokio::select! {
-                    // use biased to arrange the read and await for read
-                    // becoming ready as early as possible, as
-                    // the wait and following wakeup is a major source of
-                    // delay given the high performance of the walredo
-                    // process.
-                    //
-                    // FIXME: this comment and/or biased should be outdated by doing the readiness
-                    // clearing reads.
-                    biased;
-
-                    res = &mut read_page, if page_res.is_none() => {
-                        page_res = Some(res);
-                    }
-
-                    res = &mut resp => {
-                        match res {
-                            Some((completion, timeout_at)) => break (completion, timeout_at),
-                            None => {
-                                // in a graceful shutdown, this needs to be an Err to take down the stderr task as
-                                // well.
-                                return Err::<(), _>("stdout: all requests processed, ready for shutdown")
-                            },
-                        }
-                    }
-                }
-            };
-
-            let page_res = match page_res {
-                Some(res) => res,
-                None => {
-                    // since we did not already complete (as is likely), wrap
-                    // the read in a timeout now that we know the deadline, and
-                    // wait for it.
-                    tokio::time::timeout_at(timeout_at, read_page)
-                        .await
-                        .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
-                        .and_then(|x| x)
-                }
-            };
-
-            (page_res, completion)
+        let (completion, timeout_at) = match result_rx.recv().await {
+            Some(t) => t,
+            None => return Err("stdout: all requests processed, ready for shutdown"),
         };
+
+        let res = tokio::time::timeout_at(timeout_at, read_page(&mut stdout, &mut page_buf))
+            .await
+            .map_err(|_elapsed| StdoutTaskError::ReadTimeout)
+            .and_then(|x| x);
 
         match res {
             Ok(()) => {
