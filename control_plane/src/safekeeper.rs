@@ -175,6 +175,7 @@ impl SafekeeperNode {
                 Err(SafekeeperHttpError::Transport(_)) => Ok(false),
                 Err(e) => Err(anyhow::anyhow!("Failed to check node status: {e}")),
             },
+            true,
         )
     }
 

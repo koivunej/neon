@@ -62,6 +62,7 @@ pub fn start_etcd_process(env: &local_env::LocalEnv) -> anyhow::Result<()> {
 
             Ok(false)
         },
+        false,
     )
     .context("Failed to spawn etcd subprocess")?;
 

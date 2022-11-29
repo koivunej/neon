@@ -156,7 +156,7 @@ impl PageServerNode {
         }
 
         let mut pageserver_process = self
-            .start_node(&init_config_overrides, &self.env.base_data_dir, true)
+            .start_node(&init_config_overrides, &self.env.base_data_dir, true, false)
             .with_context(|| {
                 format!(
                     "Failed to start a process for pageserver {}",
@@ -228,7 +228,7 @@ impl PageServerNode {
     }
 
     pub fn start(&self, config_overrides: &[&str]) -> anyhow::Result<Child> {
-        self.start_node(config_overrides, &self.repo_path(), false)
+        self.start_node(config_overrides, &self.repo_path(), false, true)
     }
 
     fn start_node(
@@ -236,6 +236,7 @@ impl PageServerNode {
         config_overrides: &[&str],
         datadir: &Path,
         update_config: bool,
+        allow_recording: bool,
     ) -> anyhow::Result<Child> {
         print!(
             "Starting pageserver at '{}' in '{}'",
@@ -270,6 +271,7 @@ impl PageServerNode {
                 Err(PageserverHttpError::Transport(_)) => Ok(false),
                 Err(e) => Err(anyhow::anyhow!("Failed to check node status: {e}")),
             },
+            allow_recording,
         )
     }
 
