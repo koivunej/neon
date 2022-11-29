@@ -231,20 +231,27 @@ impl PostgresRedoManager {
 
         let record_count = records_range.sub_slice(records).len() as u64;
 
-        let result = BACKGROUND_RUNTIME.block_on(async {
-            self.handle
-                .request_redo(Request {
-                    target: buf_tag,
-                    base_img,
-                    records: records.clone(),
-                    records_range,
-                    timeout: wal_redo_timeout,
-                })
-                .await
-                .map_err(|e| {
-                    WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e))
-                })
-        });
+        // let handle = tokio::runtime::Handle::current();
+        // let result = handle
+        //     .block_on(self.handle.request_redo(Request {
+        //         target: buf_tag,
+        //         base_img,
+        //         records: records.clone(),
+        //         records_range,
+        //         timeout: wal_redo_timeout,
+        //     }))
+        //     .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
+
+        let result = self
+            .handle
+            .request_redo(Request {
+                target: buf_tag,
+                base_img,
+                records: records.clone(),
+                records_range,
+                timeout: wal_redo_timeout,
+            })
+            .map_err(|e| WalRedoError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)));
 
         let duration = start_time.elapsed();
 
@@ -671,6 +678,22 @@ impl TokioCloseFileDescriptors for tokio::process::Command {
     }
 }
 
+struct LogPolls<F>(F);
+
+impl<F: std::future::Future> std::future::Future for LogPolls<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        println!("polling with {:?}", cx.waker());
+        let me = unsafe { self.get_unchecked_mut() };
+        let inner = unsafe { std::pin::Pin::new_unchecked(&mut me.0) };
+        inner.poll(cx)
+    }
+}
+
 fn tokio_postgres_redo(
     conf: &'static PageServerConf,
     tenant_id: TenantId,
@@ -684,7 +707,8 @@ fn tokio_postgres_redo(
     // precise sizing for this would be pipe size divided by our average redo request
     let expected_inflight = 32;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
+    //let (tx, mut rx) = tokio::sync::mpsc::channel::<Payload>(expected_inflight);
+    let (tx, rx) = flume::bounded::<Payload>(expected_inflight);
 
     let ipc = async move {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -699,7 +723,7 @@ fn tokio_postgres_redo(
         // loop to handle wal-redo process failing in between. additionally tenant_mgr expects that
         // walredo does not create the temporary directory until we get the first redo request, so
         // postpone creation until we get the first one.
-        while let Some(first) = rx.recv().await {
+        while let Ok(first) = rx.recv_async().await {
             // make sure we dont have anything remaining from a past partial write
             buffers.clear();
 
@@ -726,16 +750,23 @@ fn tokio_postgres_redo(
                 let result_txs = result_txs;
                 let mut buffered = Some(first);
 
+                let mut nth = 0;
+
                 loop {
                     let (request, response) = {
                         // TODO: could we somehow manage to keep the request in case we need to
                         // restart the process? see https://github.com/neondatabase/neon/issues/1700
                         let next = buffered.take();
                         let next = if next.is_none() {
-                            rx.recv().await
+                            println!("polling for {nth}");
+                            LogPolls(rx.recv_async()).await.ok()
                         } else {
                             next
                         };
+
+                        if next.is_some() {
+                            nth += 1;
+                        }
 
                         match next {
                             Some(t) => t,
@@ -1072,7 +1103,8 @@ async fn launch_walredo(
         .context("postgres --wal-redo command failed to start")
 }
 
-type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
+// type Payload = (Request, tokio::sync::oneshot::Sender<anyhow::Result<Bytes>>);
+type Payload = (Request, flume::Sender<anyhow::Result<Bytes>>);
 
 /// WAL Redo request
 struct Request {
@@ -1085,23 +1117,25 @@ struct Request {
 
 #[derive(Clone)]
 struct Handle {
-    tx: tokio::sync::mpsc::Sender<Payload>,
-    // tx: flume::Sender<Payload>,
+    // tx: tokio::sync::mpsc::Sender<Payload>,
+    tx: flume::Sender<Payload>,
 }
 
 impl Handle {
-    async fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
-        // let (result_tx, result_rx) = flume::bounded(1);
+    fn request_redo(&self, request: Request) -> anyhow::Result<Bytes> {
+        let (result_tx, result_rx) = flume::bounded(1);
 
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        // let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         self.tx
             .send((request, result_tx))
-            .await
+            // .await
             .map_err(|_| anyhow::anyhow!("Failed to communicate with the walredo task"))?;
+        println!("sent new work");
 
         let res = result_rx
-            .await
+            .recv()
+            // .await
             .context("Failed to get a WAL Redo'd page back")
             .and_then(|x| x);
 
